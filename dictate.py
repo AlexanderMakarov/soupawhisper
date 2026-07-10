@@ -1190,9 +1190,11 @@ class Dictation:
         lang = resolve_transcription_language(
             self.model, audio_array, self.config.get("language"), self.config.get("language_allowlist")
         )
+        # No VAD filter: for pre-recorded files nothing should be dropped,
+        # and subtitle timestamps must stay aligned with the original audio.
         segments, info = self.model.transcribe(
             audio_array,
-            vad_filter=True,
+            vad_filter=False,
             language=lang,
             **self._custom_terms_kwargs,
         )
