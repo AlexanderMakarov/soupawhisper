@@ -1,4 +1,4 @@
-.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs record service-reinstall
+.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs record service-reinstall transcribe
 
 run:
 	@if command -v uv >/dev/null 2>&1; then \
@@ -43,6 +43,37 @@ run-file:
 		echo "Error: Neither uv nor poetry found. Please install one of them."; \
 		exit 1; \
 	fi
+
+transcribe:
+	@if [ -z "$$F" ]; then \
+		echo "Usage: make transcribe F=<path/to/video-or-audio> [EXT=srt|txt]"; \
+		echo "Supports any format ffmpeg can decode (.mov, .mp4, .mkv, .webm, .mp3, ...)."; \
+		echo "Writes the transcript next to the source file (default: .srt with timestamps)."; \
+		exit 1; \
+	fi; \
+	case "$$F" in "~"*) F="$$HOME$${F#\~}";; esac; \
+	if [ ! -f "$$F" ]; then \
+		echo "Error: File not found: $$F"; \
+		exit 1; \
+	fi; \
+	if ! command -v ffmpeg >/dev/null 2>&1; then \
+		echo "Error: ffmpeg not found. Install it first (e.g. brew install ffmpeg)."; \
+		exit 1; \
+	fi; \
+	EXT="$${EXT:-srt}"; \
+	OUT="$${F%.*}.$$EXT"; \
+	WAV="$${TMPDIR:-/tmp}/soupawhisper_transcribe_$$$$.wav"; \
+	trap 'rm -f "$$WAV"' EXIT; \
+	ffmpeg -y -loglevel error -i "$$F" -ar 16000 -ac 1 -c:a pcm_s16le "$$WAV" || exit 1; \
+	if command -v uv >/dev/null 2>&1; then \
+		uv run python dictate.py --file "$$WAV" --output "$$OUT"; \
+	elif command -v poetry >/dev/null 2>&1; then \
+		poetry run python dictate.py --file "$$WAV" --output "$$OUT"; \
+	else \
+		echo "Error: Neither uv nor poetry found. Please install one of them."; \
+		exit 1; \
+	fi; \
+	echo "Transcript saved to $$OUT"
 
 run-no-stream:
 	@if command -v uv >/dev/null 2>&1; then \

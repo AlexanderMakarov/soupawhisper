@@ -102,6 +102,14 @@ def _streaming_segments_to_text(segments: Iterable[Segment]) -> str:
         parts.append(text)
     return " ".join(parts).strip()
 
+def _format_srt_timestamp(seconds: float) -> str:
+    """Format seconds as an SRT timestamp: HH:MM:SS,mmm."""
+    total_ms = int(round(seconds * 1000))
+    hours, rest = divmod(total_ms, 3_600_000)
+    minutes, rest = divmod(rest, 60_000)
+    secs, ms = divmod(rest, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
 _REJECT_PUNCT_TRANSLATION = str.maketrans("", "", string.punctuation)
 
 def _normalize_reject_phrase(text: str) -> str:
@@ -1163,6 +1171,50 @@ class Dictation:
             logger.error(f"[file] Error transcribing: {e}", exc_info=True)
             raise
 
+    def transcribe_file_to_output(self, wav_file_path: str, output_path: str) -> None:
+        """
+        Transcribe a WAV file and write the result to output_path.
+        Writes SRT subtitles (with segment timestamps) if output_path ends with ".srt",
+        plain text otherwise. Expects WAV files (16-bit, 16kHz, mono).
+
+        Args:
+            wav_file_path: Path to the WAV file to transcribe
+            output_path: Path to write the transcript to
+        """
+        logger.info(f"[file] Transcribing WAV file: {wav_file_path} -> {output_path}")
+        with wave.open(wav_file_path, "rb") as wf:
+            audio_data = wf.readframes(wf.getnframes())
+        audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        if self.model_error or self.model is None:
+            raise RuntimeError("Model not loaded")
+        lang = resolve_transcription_language(
+            self.model, audio_array, self.config.get("language"), self.config.get("language_allowlist")
+        )
+        # No VAD filter: for pre-recorded files nothing should be dropped,
+        # and subtitle timestamps must stay aligned with the original audio.
+        segments, info = self.model.transcribe(
+            audio_array,
+            vad_filter=False,
+            language=lang,
+            **self._custom_terms_kwargs,
+        )
+        with open(output_path, "w", encoding="utf-8") as out:
+            if output_path.lower().endswith(".srt"):
+                index = 0
+                for segment in segments:
+                    text = segment.text.strip()
+                    if not text:
+                        continue
+                    index += 1
+                    out.write(
+                        f"{index}\n"
+                        f"{_format_srt_timestamp(segment.start)} --> {_format_srt_timestamp(segment.end)}\n"
+                        f"{text}\n\n"
+                    )
+            else:
+                out.write(self._segments_to_text(segments, self.config["auto_sentence"]) + "\n")
+        logger.info(f"[file] Transcribed {info.duration:.2f}s to {output_path}")
+
 
 class StreamingDictation(Dictation):
     """Streaming dictation mode.
@@ -1808,6 +1860,12 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
         metavar="WAV_FILE",
         help="Transcribe provided WAV file and exit"
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        metavar="OUTPUT_FILE",
+        help="With --file: write transcript to this path (.srt for subtitles with timestamps, anything else for plain text)"
+    )
     args = parser.parse_args()
     check_dependencies(config)
 
@@ -1837,7 +1895,10 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
             logger.error("Cannot transcribe file: model failed to load")
             sys.exit(1)
         try:
-            dictation.transcribe_file(args.file)
+            if args.output:
+                dictation.transcribe_file_to_output(args.file, args.output)
+            else:
+                dictation.transcribe_file(args.file)
             sys.exit(0)
         except Exception as e:
             logger.error(f"Failed to transcribe file: {e}", exc_info=True)
