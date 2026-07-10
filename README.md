@@ -200,10 +200,10 @@ make run           # default mode (config-driven)
 make run-stream    # streaming
 make run-no-stream # non-streaming
 make run-file F=path/to/audio.wav   # transcribe a file
-make transcribe-video F=path/to/video.mov # transcribe a video/audio file into subtitles next to it (requires ffmpeg)
+make transcribe F=path/to/video.mov # transcribe a video/audio file into subtitles next to it (requires ffmpeg)
 ```
 
-`make transcribe-video` extracts the audio with ffmpeg (any format ffmpeg supports: .mov, .mp4, .mp3, ...) and writes `path/to/video.srt` with timestamps. Pass `EXT=txt` for plain text without timestamps.
+`make transcribe` extracts the audio with ffmpeg (any format ffmpeg supports: .mov, .mp4, .mp3, ...) and writes `path/to/video.srt` with timestamps. Pass `EXT=txt` for plain text without timestamps.
 
 Or run directly:
 
