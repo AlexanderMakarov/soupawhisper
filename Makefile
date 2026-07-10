@@ -51,6 +51,7 @@ transcribe-video:
 		echo "Writes the transcript next to the video (default: .srt with timestamps)."; \
 		exit 1; \
 	fi; \
+	case "$$F" in "~"*) F="$$HOME$${F#\~}";; esac; \
 	if [ ! -f "$$F" ]; then \
 		echo "Error: File not found: $$F"; \
 		exit 1; \
