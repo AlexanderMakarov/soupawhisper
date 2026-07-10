@@ -1,4 +1,4 @@
-.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs record service-reinstall transcribe
+.PHONY: run run-stream run-no-stream test help service-stop service-start service-restart service-status service-logs record service-reinstall transcribe-video
 
 run:
 	@if command -v uv >/dev/null 2>&1; then \
@@ -44,9 +44,10 @@ run-file:
 		exit 1; \
 	fi
 
-transcribe:
+transcribe-video:
 	@if [ -z "$$F" ]; then \
-		echo "Usage: make transcribe F=<path/to/video.mov> [EXT=srt|txt]"; \
+		echo "Usage: make transcribe-video F=<path/to/video> [EXT=srt|txt]"; \
+		echo "Supports any format ffmpeg can decode (.mov, .mp4, .mkv, .webm, ...)."; \
 		echo "Writes the transcript next to the video (default: .srt with timestamps)."; \
 		exit 1; \
 	fi; \
