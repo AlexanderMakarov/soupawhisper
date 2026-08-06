@@ -19,6 +19,22 @@ Runs entirely on your machine — no cloud or API keys. Optional NVIDIA GPU supp
 
 ---
 
+## How it differs from other local dictation tools
+
+Most offline dictation apps are push-to-talk: hold a key, speak, release, and the whole utterance is inserted in one go. That is also what SoupaWhisper does in non-streaming mode. The differences are in the streaming path and in multilingual control.
+
+| Capability | SoupaWhisper | Typical push-to-talk app |
+|---|---|---|
+| Text insertion | Chunk by chunk **while you speak**, so you can type a URL or a name by hand mid-dictation and keep talking | Buffered and inserted once, after you stop (a live preview may be shown, but the insertion is still a single paste) |
+| Two-language dictation | `language_allowlist` restricts detection to your languages, and `enforce_language_from_layout` picks the language from the active keyboard layout | One global language, or unconstrained auto-detect that can drift on short utterances |
+| Custom terms | Passed to the decoder as `hotwords` + `initial_prompt`, so the model is biased toward them while transcribing | Usually a find-and-replace pass over the finished text |
+| Control surface | Config file, CLI flags, systemd / launchd unit | GUI app |
+| Batch transcription | Audio and video files to `.srt` / `.txt` | Live dictation only |
+
+What SoupaWhisper does not have yet: an on-screen recording indicator (see the roadmap below), a model manager, and backends other than faster-whisper.
+
+---
+
 ## Requirements
 
 - **Python 3.10+**
@@ -403,6 +419,7 @@ uv run pytest dictate_tests.py
 - [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
 - [x] Multiple languages support.
 - [x] Support list of custom terms or pronunciation features (like accents or speech patterns).
+- [ ] On-screen recording indicator, so it is always visible when the microphone is live.
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
 - [ ] Expose more `model.transcribe()` options in config.
