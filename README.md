@@ -31,7 +31,7 @@ Most offline dictation apps are push-to-talk: hold a key, speak, release, and th
 | Control surface | Config file, CLI flags, systemd / launchd unit | GUI app |
 | Batch transcription | Audio and video files to `.srt` / `.txt` | Live dictation only |
 
-What SoupaWhisper does not have yet: an on-screen recording indicator (see the roadmap below), a model manager, and backends other than faster-whisper.
+What SoupaWhisper does not have yet: a menu bar / tray status icon (see the roadmap below), a model manager, and backends other than faster-whisper.
 
 ---
 
@@ -422,7 +422,7 @@ uv run pytest dictate_tests.py
 - [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
 - [x] Multiple languages support.
 - [x] Support list of custom terms or pronunciation features (like accents or speech patterns).
-- [ ] On-screen recording indicator, so it is always visible when the microphone is live.
+- [ ] Status icon in the menu bar / system tray, so it is always visible when the microphone is live.
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
 - [ ] Expose more `model.transcribe()` options in config.
