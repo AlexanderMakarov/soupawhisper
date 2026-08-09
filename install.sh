@@ -62,20 +62,20 @@ install_deps() {
     case $pm in
         apt)
             sudo apt update
-            sudo apt install -y alsa-utils xclip xdotool libnotify-bin
+            sudo apt install -y alsa-utils xclip xdotool libnotify-bin gir1.2-ayatanaappindicator3-0.1
             ;;
         dnf)
-            sudo dnf install -y alsa-utils xclip xdotool libnotify
+            sudo dnf install -y alsa-utils xclip xdotool libnotify libappindicator-gtk3
             ;;
         pacman)
-            sudo pacman -S --noconfirm alsa-utils xclip xdotool libnotify
+            sudo pacman -S --noconfirm alsa-utils xclip xdotool libnotify libayatana-appindicator
             ;;
         zypper)
             sudo zypper install -y alsa-utils xclip xdotool libnotify-tools
             ;;
         *)
             echo "Unknown package manager. Please install manually:"
-            echo "  alsa-utils xclip xdotool libnotify"
+            echo "  alsa-utils xclip xdotool libnotify (+ AppIndicator/StatusNotifier for the tray icon)"
             ;;
     esac
 }

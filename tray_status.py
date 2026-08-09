@@ -1,0 +1,480 @@
+"""Menu bar / system tray status icon for SoupaWhisper."""
+
+from __future__ import annotations
+
+import logging
+import platform
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from PIL import Image, ImageDraw, ImageFont
+
+logger = logging.getLogger(__name__)
+
+ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "tray"
+POLL_INTERVAL_S = 0.2  # Icon / tooltip / menu label refresh only; actions are immediate
+STATE_NAMES = ("idle", "loading", "recording", "transcribing", "error")
+# Widen every chip to this label so EN/RU center like AUTO.
+BADGE_WIDTH_GUIDE = "AUTO"
+BADGE_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/SFNS.ttf",
+)
+
+IS_MACOS = platform.system() == "Darwin"
+
+
+class TrayStartError(Exception):
+    """Tray requested but could not be started."""
+
+
+def derive_state(dictation: Any) -> str:
+    """Map dictation flags to a tray state name.
+
+    Priority: error > loading > recording > transcribing > idle
+    """
+    if getattr(dictation, "model_error", None) or getattr(dictation, "_tray_error", None):
+        return "error"
+    if not getattr(dictation, "model_loaded", None) or not dictation.model_loaded.is_set():
+        return "loading"
+    if getattr(dictation, "recording", False):
+        return "recording"
+    if getattr(dictation, "stopping", False) or getattr(dictation, "transcribing", False):
+        return "transcribing"
+    return "idle"
+
+
+def config_flag(dictation: Any, key: str, default: bool = True) -> bool:
+    config = getattr(dictation, "config", None) or {}
+    if isinstance(config, dict):
+        return bool(config.get(key, default))
+    return default
+
+
+def language_label(dictation: Any) -> tuple[str, bool]:
+    """Return (label, from_layout) for the language badge / menu line."""
+    session = getattr(dictation, "_session_enforced_language", None)
+    if session:
+        return session.upper(), True
+    configured = None
+    config = getattr(dictation, "config", None) or {}
+    if isinstance(config, dict):
+        configured = config.get("language")
+    if configured:
+        return str(configured).upper(), False
+    return "AUTO", False
+
+
+def tooltip_for(dictation: Any, state: str) -> str:
+    hotkey = "F12"
+    get_name = getattr(dictation, "get_hotkey_name", None)
+    if callable(get_name):
+        hotkey = (get_name() or "F12").upper()
+    config = getattr(dictation, "config", None) or {}
+    model = config.get("model", "model") if isinstance(config, dict) else "model"
+    err = getattr(dictation, "model_error", None) or getattr(dictation, "_tray_error", None)
+
+    if state == "loading":
+        return f"SoupaWhisper - loading {model}..."
+    if state == "recording":
+        return f"Recording - press {hotkey} to stop"
+    if state == "transcribing":
+        return "Transcribing..."
+    if state == "error":
+        return str(err) if err else "SoupaWhisper - error"
+    return f"SoupaWhisper - idle ({hotkey} to record)"
+
+
+def latin1_safe(text: str) -> str:
+    """AppIndicator/DBus titles are latin-1; drop non-encodable chars."""
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def badge_font_size(icon_height: int) -> int:
+    """Point size tuned for downscaled tray panels (regular weight, not bold)."""
+    return max(10, int(round((icon_height / 4) * 1.7)) - 3)
+
+
+def load_badge_font(size: int) -> ImageFont.ImageFont:
+    for path in BADGE_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def compose_language_badge(base: Image.Image, badge: str) -> Image.Image:
+    """Draw a language chip bottom-centered on the icon (XFCE often ignores AppIndicator labels)."""
+    if not badge:
+        return base
+    img = base.copy().convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    font = load_badge_font(badge_font_size(h))
+    guide_bbox = draw.textbbox((0, 0), BADGE_WIDTH_GUIDE, font=font)
+    text_bbox = draw.textbbox((0, 0), badge, font=font)
+    tw = text_bbox[2] - text_bbox[0]
+    th = text_bbox[3] - text_bbox[1]
+    chip_tw = max(tw, guide_bbox[2] - guide_bbox[0])
+    chip_th = max(th, guide_bbox[3] - guide_bbox[1])
+    pad_x = max(2, h // 20)
+    pad_y = max(1, h // 28)
+    chip_w = min(w, chip_tw + 2 * pad_x)
+    chip_h = min(h, chip_th + 2 * pad_y)
+    x0 = (w - chip_w) // 2
+    y0 = h - chip_h
+    draw.rectangle((x0, y0, x0 + chip_w - 1, y0 + chip_h - 1), fill=(20, 20, 20, 230))
+    tx = x0 + (chip_w - tw) // 2 - text_bbox[0]
+    ty = y0 + (chip_h - th) // 2 - text_bbox[1]
+    draw.text((tx, ty), badge, fill=(255, 255, 255, 255), font=font)
+    return img
+
+
+def load_state_images(assets_dir: Path = ASSETS_DIR) -> dict[str, Image.Image]:
+    """Load 64×64 state PNGs (required). Optionally keep 16px variants aside."""
+    images: dict[str, Image.Image] = {}
+    missing = []
+    for name in STATE_NAMES:
+        path = assets_dir / f"{name}.png"
+        if not path.is_file():
+            missing.append(str(path))
+            continue
+        images[name] = Image.open(path).convert("RGBA")
+    if missing:
+        raise TrayStartError(f"Missing tray assets: {', '.join(missing)}")
+    return images
+
+
+def _open_path(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    if IS_MACOS:
+        subprocess.Popen(["open", str(path)], start_new_session=True)
+    else:
+        subprocess.Popen(["xdg-open", str(path)], start_new_session=True)
+
+
+def _open_linux_journal() -> bool:
+    terminal_cmds = [
+        ["xdg-terminal-exec", "journalctl", "--user", "-u", "soupawhisper", "-e"],
+        ["x-terminal-emulator", "-e", "journalctl --user -u soupawhisper -e"],
+    ]
+    for cmd in terminal_cmds:
+        try:
+            subprocess.Popen(cmd, start_new_session=True)
+            return True
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logger.debug("journalctl terminal launch failed (%s): %s", cmd[0], e)
+    return False
+
+
+class TrayStatus:
+    """Owns the pystray main-thread loop.
+
+    Menu actions (Start/Stop, Quit, …) run immediately via callbacks.
+    A short poll only refreshes icon, tooltip, and dynamic menu labels.
+    """
+
+    def __init__(self, dictation: Any, assets_dir: Path = ASSETS_DIR):
+        self.dictation = dictation
+        self.assets_dir = assets_dir
+        self._images = load_state_images(assets_dir)
+        self._images_16: dict[str, Image.Image] = {}
+        for name in STATE_NAMES:
+            p16 = assets_dir / f"{name}-16.png"
+            if p16.is_file():
+                self._images_16[name] = Image.open(p16).convert("RGBA")
+        self._icon = None
+        self._last_state: Optional[str] = None
+        self._last_title: Optional[str] = None
+        self._last_menu_signature: Optional[tuple] = None
+        self._last_badge: Optional[str] = None
+        self._stop_poll = threading.Event()
+
+    def prepare(self) -> None:
+        """Import pystray / create Icon (does not block). Raises TrayStartError."""
+        try:
+            import pystray
+            from pystray import Menu, MenuItem
+        except Exception as e:
+            raise TrayStartError(f"Failed to import pystray: {e}") from e
+
+        state = derive_state(self.dictation)
+        badge = self._language_badge_text()
+        image = self._image_for(state, badge)
+        title = self._title_for(state)
+
+        menu = Menu(
+            MenuItem(lambda item: self._state_menu_text(), None, enabled=False),
+            MenuItem(lambda item: self._model_menu_text(), None, enabled=False),
+            MenuItem(lambda item: self._language_menu_text(), None, enabled=False),
+            Menu.SEPARATOR,
+            MenuItem(
+                self._toggle_menu_text,
+                self._on_toggle_dictation,
+                enabled=self._toggle_enabled,
+            ),
+            MenuItem("Restart hotkey listener", self._on_restart_listener),
+            MenuItem("Open log", self._on_open_log),
+            MenuItem("Open config", self._on_open_config),
+            MenuItem("Quit", self._on_quit),
+        )
+
+        try:
+            self._icon = pystray.Icon(
+                "soupawhisper",
+                icon=image,
+                title=title,
+                menu=menu,
+            )
+        except Exception as e:
+            raise TrayStartError(f"Failed to create system tray icon: {e}") from e
+
+        self._last_state = state
+        self._last_title = title
+        self._last_badge = badge
+
+    def run_blocking(self) -> None:
+        """Block on the tray event loop (main thread). Call prepare() first."""
+        if self._icon is None:
+            self.prepare()
+        assert self._icon is not None
+        try:
+            self._icon.run(setup=self._setup)
+        except TrayStartError:
+            raise
+        except Exception as e:
+            raise TrayStartError(f"Tray icon failed: {e}") from e
+
+    def stop(self) -> None:
+        self._stop_poll.set()
+        icon = self._icon
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception as e:
+                logger.debug("tray icon.stop() failed: %s", e)
+
+    def _setup(self, icon) -> None:
+        icon.visible = True
+        try:
+            while not self._stop_poll.is_set() and getattr(self.dictation, "running", True):
+                self._refresh(icon)
+                time.sleep(POLL_INTERVAL_S)
+        finally:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+    def _refresh(self, icon) -> None:
+        state = derive_state(self.dictation)
+        title = self._title_for(state)
+        badge = self._language_badge_text()
+        if state != self._last_state or badge != self._last_badge:
+            icon.icon = self._image_for(state, badge)
+            self._apply_template_if_needed(state)
+            self._apply_language_badge(badge)
+            self._last_state = state
+            self._last_badge = badge
+        if title != self._last_title:
+            icon.title = title
+            self._last_title = title
+        # Only rebuild the menu when labels/enablement change. Calling
+        # update_menu() every poll closes an open menu on AppIndicator/XFCE.
+        sig = self._menu_signature()
+        if sig != self._last_menu_signature:
+            try:
+                icon.update_menu()
+            except Exception:
+                pass
+            self._last_menu_signature = sig
+
+    def _image_for(self, state: str, badge: str = "") -> Image.Image:
+        base = self._images[state]
+        if badge:
+            return compose_language_badge(base, badge)
+        return base
+
+    def _language_badge_text(self) -> str:
+        if not config_flag(self.dictation, "tray_show_language", True):
+            return ""
+        label, _ = language_label(self.dictation)
+        return latin1_safe(label)
+
+    def _apply_language_badge(self, badge: str) -> None:
+        """Also set AppIndicator/macOS native labels when available (icon pixmap is primary)."""
+        icon = self._icon
+        if icon is None:
+            return
+        appind = getattr(icon, "_appindicator", None)
+        if appind is not None:
+            guide = "WWW" if badge else ""
+
+            def apply():
+                try:
+                    appind.set_label(badge, guide)
+                except Exception as e:
+                    logger.debug("set_label failed: %s", e)
+                return False
+
+            try:
+                from gi.repository import GLib
+
+                GLib.idle_add(apply)
+            except Exception as e:
+                logger.debug("Could not schedule set_label: %s", e)
+            return
+
+        status_item = getattr(icon, "_status_item", None)
+        if status_item is not None and IS_MACOS:
+            try:
+                status_item.button().setTitle_(badge)
+            except Exception as e:
+                logger.debug("macOS setTitle_ failed: %s", e)
+
+    def _menu_signature(self) -> tuple:
+        """Stable snapshot of dynamic menu fields (avoid needless rebuilds)."""
+        return (
+            derive_state(self.dictation),
+            self._state_menu_text(),
+            self._model_menu_text(),
+            self._language_menu_text(),
+            self._toggle_menu_text(),
+            self._toggle_enabled(),
+        )
+
+    def _apply_template_if_needed(self, state: str) -> None:
+        if not IS_MACOS or self._icon is None:
+            return
+        if state not in {"idle", "loading"}:
+            return
+        ns_image = getattr(self._icon, "_icon_image", None)
+        if ns_image is None:
+            return
+        try:
+            ns_image.setTemplate_(True)
+        except Exception as e:
+            logger.debug("Could not mark tray image as template: %s", e)
+
+    def _title_for(self, state: str) -> str:
+        tip = tooltip_for(self.dictation, state)
+        if not config_flag(self.dictation, "tray_show_language", True):
+            return latin1_safe(tip)
+        label, _ = language_label(self.dictation)
+        return latin1_safe(f"{tip} [{label}]")
+
+    def _state_menu_text(self) -> str:
+        state = derive_state(self.dictation)
+        return f"● {state.capitalize()}"
+
+    def _model_menu_text(self) -> str:
+        config = getattr(self.dictation, "config", None) or {}
+        model = config.get("model", "?") if isinstance(config, dict) else "?"
+        return f"Model: {model}"
+
+    def _language_menu_text(self) -> str:
+        label, from_layout = language_label(self.dictation)
+        if from_layout:
+            return f"Language: {label} (from layout)"
+        return f"Language: {label}"
+
+    def _toggle_menu_text(self, item=None) -> str:
+        d = self.dictation
+        if (
+            getattr(d, "recording", False)
+            or getattr(d, "stopping", False)
+            or getattr(d, "transcribing", False)
+        ):
+            return "Stop dictation"
+        return "Start dictation"
+
+    def _toggle_enabled(self, item=None) -> bool:
+        state = derive_state(self.dictation)
+        if state == "loading":
+            return False
+        # Allow Stop while busy; block Start when stuck in error and not recording
+        if state == "error" and not getattr(self.dictation, "recording", False):
+            return False
+        if getattr(self.dictation, "stopping", False) or getattr(self.dictation, "transcribing", False):
+            # Stop already in progress — leave item visible but inactive
+            return False
+        return True
+
+    def _on_toggle_dictation(self, icon, item) -> None:
+        """Same immediate path as the hotkey (not gated on the icon poll)."""
+        d = self.dictation
+        schedule = getattr(d, "_schedule_hotkey_action", None)
+        if getattr(d, "recording", False):
+            if callable(schedule):
+                schedule(d.stop_recording, "stop_recording")
+            else:
+                d.stop_recording()
+        else:
+            if callable(schedule):
+                schedule(d.start_recording, "start_recording")
+            else:
+                d.start_recording()
+        # Best-effort snappy visual update; poll will catch up if this races
+        try:
+            self._refresh(icon)
+        except Exception:
+            pass
+
+    def _on_restart_listener(self, icon, item) -> None:
+        fn: Optional[Callable[[], None]] = getattr(self.dictation, "restart_hotkey_listener", None)
+        if not callable(fn):
+            logger.warning("restart_hotkey_listener is not available")
+            return
+        try:
+            fn()
+        except Exception as e:
+            logger.error("Failed to restart hotkey listener: %s", e, exc_info=True)
+            self.dictation._tray_error = str(e)
+
+    def _on_open_log(self, icon, item) -> None:
+        if IS_MACOS:
+            log_path = Path.home() / "Library" / "Logs" / "soupawhisper.log"
+            try:
+                _open_path(log_path)
+                return
+            except FileNotFoundError:
+                logger.warning("Log file not found at %s (foreground runs log to stderr)", log_path)
+                return
+        if _open_linux_journal():
+            return
+        logger.warning(
+            "Could not open journalctl for soupawhisper; foreground runs log to stderr. "
+            "Try: journalctl --user -u soupawhisper -f"
+        )
+
+    def _on_open_config(self, icon, item) -> None:
+        # Prefer path from dictate module when available
+        try:
+            import dictate as dictate_mod
+
+            path = Path(dictate_mod.CONFIG_PATH)
+        except Exception:
+            path = Path.home() / ".config" / "soupawhisper" / "config.ini"
+        try:
+            _open_path(path)
+        except FileNotFoundError:
+            logger.warning(
+                "Config not found at %s — copy config.example.ini there first",
+                path,
+            )
+
+    def _on_quit(self, icon, item) -> None:
+        try:
+            self.dictation.stop()
+        finally:
+            self.stop()
