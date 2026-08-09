@@ -9,6 +9,7 @@ import queue
 from unittest.mock import MagicMock, patch
 from typing import Any
 from types import SimpleNamespace
+import threading
 
 # Add 2 second timeout to all tests to prevent infinite loops
 pytestmark = pytest.mark.timeout(2)
@@ -105,6 +106,8 @@ auto_type = true
 notifications = false
 default_streaming = false
 clipboard = true
+tray_icon = false
+tray_show_language = true
 
 [streaming]
 vad_silence_threshold_seconds = 1.0
@@ -463,6 +466,89 @@ class TestDictation:
         assert dictate.language_from_layout("com.apple.keylayout.US", m) == "en"
         assert dictate.language_from_layout("com.apple.keylayout.Russian", {}) is None
 
+    def test_linux_active_xkb_layout_uses_group_index(self, monkeypatch):
+        monkeypatch.setattr(dictate, "_which_ok", lambda name: False)
+        monkeypatch.setattr(
+            dictate,
+            "_linux_xkb_layouts_from_setxkbmap",
+            lambda: ["us", "ru", "am"],
+        )
+        monkeypatch.setattr(dictate, "_linux_xkb_group_index", lambda: 1)
+        assert dictate._linux_active_xkb_layout() == "ru"
+
+    def test_parse_setxkbmap_layouts(self):
+        assert dictate.parse_setxkbmap_layouts("rules: evdev\nlayout: us,ru,am\n") == [
+            "us",
+            "ru",
+            "am",
+        ]
+        assert dictate.parse_setxkbmap_layouts("layout: ru\n") == ["ru"]
+        assert dictate.parse_setxkbmap_layouts("") is None
+        assert dictate.parse_setxkbmap_layouts("model: pc104\n") is None
+
+    def test_linux_active_prefers_xkb_switch(self, monkeypatch):
+        monkeypatch.setattr(
+            dictate,
+            "_which_ok",
+            lambda name: name == "xkb-switch",
+        )
+        monkeypatch.setattr(dictate, "_run_cmd", lambda cmd, timeout_s=0.5: "ru")
+        monkeypatch.setattr(
+            dictate,
+            "_linux_xkb_layouts_from_setxkbmap",
+            lambda: (_ for _ in ()).throw(AssertionError("should not fall back")),
+        )
+        assert dictate._linux_active_xkb_layout() == "ru"
+
+    def test_detect_current_keyboard_language_linux_maps_us(self, monkeypatch):
+        monkeypatch.setattr(dictate, "IS_MACOS", False)
+        monkeypatch.setattr(dictate, "detect_current_keyboard_layout", lambda: "us,ru,am")
+        monkeypatch.setattr(dictate, "_linux_active_xkb_layout", lambda: "us")
+        assert dictate.detect_current_keyboard_language({"us": "en", "ru": "ru"}) == "en"
+
+    def test_capture_session_language_uses_active_layout_not_layout_list(
+        self, mock_config, monkeypatch
+    ):
+        """setxkbmap layout_id is often 'us,ru,am'; capture must use active group."""
+        content = mock_config.read_text()
+        content = content.replace(
+            "compute_type = int8",
+            "compute_type = int8\nlanguage = auto\nlanguage_allowlist = en, ru",
+        )
+        content = content.replace(
+            "clipboard = true",
+            "clipboard = true\n"
+            "enforce_language_from_layout = true\n"
+            "layout_to_language = us:en, ru:ru",
+        )
+        mock_config.write_text(content)
+        config = dictate.load_config()
+        monkeypatch.setattr(dictate, "IS_MACOS", False)
+        monkeypatch.setattr(dictate, "detect_current_keyboard_layout", lambda: "us,ru,am")
+        monkeypatch.setattr(dictate, "_linux_active_xkb_layout", lambda: "ru")
+        d = dictate.Dictation(config)
+        d._begin_session_language()
+        assert d._session_enforced_language == "ru"
+        d._end_session_language()
+        assert d._session_enforced_language is None
+
+    def test_stop_recording_clears_session_language(
+        self, mock_config, mock_whisper_model, mock_xdotool
+    ):
+        config = dictate.load_config()
+        config["enforce_language_from_layout"] = True
+        d = dictate.Dictation(config)
+        d.model_loaded.set()
+        d.recording = True
+        d.audio_data = []
+        d.audio_thread = None
+        d.audio_stream = None
+        d._session_enforced_language = "en"
+        with patch.object(d, "_report_audio_problem"):
+            d.stop_recording()
+        assert d._session_enforced_language is None
+        assert d.transcribing is False
+
     def test_enforce_language_from_layout_overrides_auto(self, mock_config, monkeypatch):
         # Set auto language + allowlist.
         content = mock_config.read_text()
@@ -698,6 +784,325 @@ class TestClipboardIntegration:
             dictate.check_dependencies({"clipboard": True, "auto_type": False, "default_streaming": False})
 
 
+class TestTrayStatus:
+    def test_load_config_tray_defaults(self, mock_config):
+        config = dictate.load_config()
+        assert config["tray_icon"] is False  # mock_config sets false
+        assert config["tray_show_language"] is True
+
+    def test_load_config_tray_defaults_when_unset(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.ini"
+        config_file.write_text("[whisper]\nmodel = base.en\n[behavior]\nnotifications = false\n")
+        monkeypatch.setattr(dictate, "CONFIG_PATH", config_file)
+        config = dictate.load_config()
+        assert config["tray_icon"] is True
+        assert config["tray_show_language"] is True
+
+    def test_derive_state_priority(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            model_error=None,
+            _tray_error=None,
+            model_loaded=threading.Event(),
+            recording=False,
+            stopping=False,
+            transcribing=False,
+        )
+        assert tray_status.derive_state(d) == "loading"
+        d.model_loaded.set()
+        assert tray_status.derive_state(d) == "idle"
+        d.recording = True
+        assert tray_status.derive_state(d) == "recording"
+        d.recording = False
+        d.stopping = True
+        assert tray_status.derive_state(d) == "transcribing"
+        d.stopping = False
+        d.transcribing = True
+        assert tray_status.derive_state(d) == "transcribing"
+        d.transcribing = False
+        d.model_error = "boom"
+        assert tray_status.derive_state(d) == "error"
+
+    def test_language_label_precedence(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            _session_enforced_language="ru",
+            config={"language": "en"},
+        )
+        assert tray_status.language_label(d) == ("RU", True)
+        d._session_enforced_language = None
+        assert tray_status.language_label(d) == ("EN", False)
+        d.config["language"] = None
+        assert tray_status.language_label(d) == ("AUTO", False)
+
+    def test_tooltip_idle_includes_hotkey(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            config={"model": "base.en"},
+            get_hotkey_name=lambda: "f12",
+            model_error=None,
+            _tray_error=None,
+        )
+        tip = tray_status.tooltip_for(d, "idle")
+        assert "F12" in tip
+        assert "idle" in tip.lower()
+        # AppIndicator titles are latin-1
+        tip.encode("latin-1")
+
+    def test_compose_language_badge_draws_pixels(self):
+        import tray_status
+        from PIL import Image
+
+        base = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        out = tray_status.compose_language_badge(base, "AUTO")
+        assert out.size == (64, 64)
+        # Badge should paint some opaque pixels where the chip is
+        assert max(px[3] for px in out.getdata()) > 200
+
+    def test_latin1_safe_replaces_non_latin1(self):
+        import tray_status
+
+        assert tray_status.latin1_safe("SoupaWhisper - idle") == "SoupaWhisper - idle"
+        out = tray_status.latin1_safe("ok — dash")
+        out.encode("latin-1")
+        assert "—" not in out
+
+    def test_tray_title_includes_language(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            config={"model": "base", "language": None, "tray_show_language": True},
+            get_hotkey_name=lambda: "f12",
+            model_error=None,
+            _tray_error=None,
+            _session_enforced_language="en",
+        )
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = d
+        assert "[EN]" in tray._title_for("recording")
+        d.config["tray_show_language"] = False
+        assert "[EN]" not in tray._title_for("recording")
+
+    def test_badge_hidden_when_tray_show_language_false(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            config={"tray_show_language": False, "language": None},
+            _session_enforced_language="ru",
+        )
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = d
+        assert tray._language_badge_text() == ""
+
+    def test_refresh_skips_update_menu_when_signature_unchanged(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            model_error=None,
+            _tray_error=None,
+            model_loaded=threading.Event(),
+            recording=False,
+            stopping=False,
+            transcribing=False,
+            config={"model": "base", "language": None, "tray_show_language": True},
+            get_hotkey_name=lambda: "f12",
+            _session_enforced_language=None,
+        )
+        d.model_loaded.set()
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = d
+        tray._images = {name: MagicMock() for name in tray_status.STATE_NAMES}
+        tray._last_state = "idle"
+        tray._last_title = tray._title_for("idle")
+        tray._last_badge = "AUTO"
+        tray._last_menu_signature = tray._menu_signature()
+        tray._icon = None
+        icon = MagicMock()
+        with patch.object(tray, "_image_for", return_value=MagicMock()):
+            tray._refresh(icon)
+        icon.update_menu.assert_not_called()
+
+    def test_compose_language_badge_short_labels_match_auto_width(self):
+        """EN/RU use the same centered chip as AUTO (same left/right edges)."""
+        import tray_status
+        from PIL import Image
+
+        base = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        auto = tray_status.compose_language_badge(base, "AUTO")
+        en = tray_status.compose_language_badge(base, "EN")
+
+        def chip_bounds(img: Image.Image) -> tuple[int, int]:
+            px = img.load()
+            left, right = img.width, -1
+            for x in range(img.width):
+                for y in range(img.height):
+                    if px[x, y][3] > 200 and px[x, y][0] < 40:
+                        left = min(left, x)
+                        right = max(right, x)
+            return left, right
+
+        assert chip_bounds(auto) == chip_bounds(en)
+        left, right = chip_bounds(auto)
+        # Horizontally centered; vertically at the bottom.
+        assert abs((left + right) / 2 - 31.5) < 3
+        px = auto.load()
+        bottom_has_chip = any(
+            px[x, auto.height - 1][3] > 200 and px[x, auto.height - 1][0] < 40
+            for x in range(auto.width)
+        )
+        assert bottom_has_chip
+
+    def test_clear_session_language_resets_tray_to_auto(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            _session_enforced_language="ru",
+            config={"language": None},
+        )
+        assert tray_status.language_label(d) == ("RU", True)
+        d._session_enforced_language = None
+        assert tray_status.language_label(d) == ("AUTO", False)
+
+    def test_toggle_menu_text_and_action_schedules_immediately(self):
+        import tray_status
+
+        calls = []
+        d = SimpleNamespace(
+            recording=False,
+            stopping=False,
+            transcribing=False,
+            model_error=None,
+            _tray_error=None,
+            model_loaded=threading.Event(),
+            config={"model": "base.en", "tray_show_language": False},
+            start_recording=lambda: calls.append("start"),
+            stop_recording=lambda: calls.append("stop"),
+            _schedule_hotkey_action=lambda fn, name: calls.append((name, fn)),
+        )
+        d.model_loaded.set()
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = d
+        tray._icon = None
+        tray._last_state = None
+        tray._last_title = None
+        tray._images = {}
+        tray._images_16 = {}
+
+        assert tray._toggle_menu_text() == "Start dictation"
+        assert tray._toggle_enabled() is True
+        tray._on_toggle_dictation(MagicMock(), None)
+        assert calls[0][0] == "start_recording"
+
+        d.recording = True
+        calls.clear()
+        assert tray._toggle_menu_text() == "Stop dictation"
+        tray._on_toggle_dictation(MagicMock(), None)
+        assert calls[0][0] == "stop_recording"
+
+    def test_missing_assets_raises(self, tmp_path):
+        import tray_status
+
+        with pytest.raises(tray_status.TrayStartError):
+            tray_status.load_state_images(tmp_path)
+
+    def test_run_with_tray_false_skips_tray(self, mock_config, mock_whisper_model, mock_xdotool):
+        config = dictate.load_config()
+        config["tray_icon"] = False
+        d = dictate.Dictation(config)
+        d.model_loaded.set()
+        calls = []
+
+        def fake_loop():
+            calls.append("supervisor")
+            d.running = False
+
+        with patch.object(d, "_run_supervisor_loop", side_effect=fake_loop):
+            with patch.dict(sys.modules, {"tray_status": MagicMock()}):
+                d.run()
+        assert calls == ["supervisor"]
+
+    def test_run_with_tray_true_exits_on_prepare_failure(
+        self, mock_config, mock_whisper_model, mock_xdotool
+    ):
+        import tray_status
+
+        config = dictate.load_config()
+        config["tray_icon"] = True
+        d = dictate.Dictation(config)
+        d.model_loaded.set()
+
+        with patch.object(tray_status.TrayStatus, "prepare", side_effect=tray_status.TrayStartError("no host")):
+            with pytest.raises(SystemExit) as ei:
+                d.run()
+            assert ei.value.code == 1
+
+    def test_compose_empty_badge_returns_base(self):
+        import tray_status
+        from PIL import Image
+
+        base = Image.new("RGBA", (64, 64), (1, 2, 3, 255))
+        assert tray_status.compose_language_badge(base, "") is base
+
+    def test_prepare_builds_icon_with_mocked_pystray(self, tmp_path):
+        import tray_status
+        from PIL import Image
+
+        assets = tmp_path / "tray"
+        assets.mkdir()
+        for name in tray_status.STATE_NAMES:
+            Image.new("RGBA", (64, 64), (0, 0, 0, 255)).save(assets / f"{name}.png")
+
+        d = SimpleNamespace(
+            model_error=None,
+            _tray_error=None,
+            model_loaded=threading.Event(),
+            recording=False,
+            stopping=False,
+            transcribing=False,
+            config={"model": "base", "language": None, "tray_show_language": True},
+            get_hotkey_name=lambda: "f12",
+            _session_enforced_language=None,
+            running=True,
+        )
+        d.model_loaded.set()
+
+        fake_icon = MagicMock()
+        fake_pystray = MagicMock()
+        fake_pystray.Icon.return_value = fake_icon
+        fake_menu = MagicMock()
+        fake_menu.SEPARATOR = object()
+        fake_pystray.Menu = fake_menu
+        fake_pystray.MenuItem = MagicMock()
+
+        with patch.dict(sys.modules, {"pystray": fake_pystray}):
+            # Re-import Menu inside prepare from pystray — inject via import
+            import types
+
+            mod = types.ModuleType("pystray")
+            mod.Icon = fake_pystray.Icon
+            mod.Menu = fake_menu
+            mod.MenuItem = MagicMock(return_value=MagicMock())
+            with patch.dict(sys.modules, {"pystray": mod}):
+                tray = tray_status.TrayStatus(d, assets_dir=assets)
+                tray.prepare()
+        assert tray._icon is fake_icon
+        mod.Icon.assert_called_once()
+
+    def test_language_menu_text_from_layout(self):
+        import tray_status
+
+        d = SimpleNamespace(
+            _session_enforced_language="ru",
+            config={"language": None},
+        )
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = d
+        assert tray._language_menu_text() == "Language: RU (from layout)"
+        d._session_enforced_language = None
+        assert tray._language_menu_text() == "Language: AUTO"
 
 
 if __name__ == "__main__":

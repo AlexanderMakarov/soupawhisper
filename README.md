@@ -1,68 +1,51 @@
 # SoupaWhisper Streaming
 
-**SoupaWhisper Streaming** is a local voice dictation tool for **Linux** and **macOS**, aimed at low-resource machines and low latency. Speak into your microphone; your words are transcribed with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and either pasted to the clipboard and typed into the active input field, or streamed in as you talk.
+Built-in speech-to-text (macOS dictation / F6, Windows voice typing) and typical local tools (Handy and similar) are push-to-talk: you speak, stop, and get one block of text. That breaks down the moment you need a URL, patient ID, case cite, API path, or proper name the model will mangle — you cancel dictation, type by hand, then start again.
 
-Target workflow (streaming mode) is:
-- press a hotkey and speak into your microphone until need to enter custom term or complex characters sequence (even most sophisticated speech recognition systems can't handle URLs, email addresses, names, etc.),
-- type custom term/characters sequence on the keyboard,
-- continue speaking,
-- press a hotkey when you finished.
+**SoupaWhisper Streaming** is for that gap. It is local voice dictation for **Linux** and **macOS** where you **speak and type in the same breath**: dictate the boilerplate, type the precise bit yourself, keep talking. Technical workers (IT, medical, legal, and anyone living in forms, tickets, and docs) get the speed of speech without giving up control over the tokens that must be exact.
 
-It increases your words-per-minute speed in 3-4 times, from ~40 WPM to ~150 WPM. Even professionals can't type faster than 75 WPM ([ref](https://www.medrxiv.org/content/10.1101/2025.05.11.25327386v1.full)).
+On-device [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — no cloud, no API keys. Optional NVIDIA GPU. A tray / menu-bar icon shows when the mic is live and which language the session is using.
 
-- **Streaming:** Start/stop with the hotkey; speech is split by silence (VAD) and transcribed in chunks so text appears as you speak.
-- **Push-to-talk (non-streaming):** Hold a hotkey to record, release to transcribe the full recording and insert the text. May not behave correctly in terminals or other environments that handle keyboard input in special ways.
+### How you use it (streaming)
 
-Runs entirely on your machine — no cloud or API keys. Optional NVIDIA GPU support for faster transcription.
+1. Press the hotkey and speak until you need a URL, email, ID, cite, or other awkward sequence.
+2. Type that bit on the keyboard (text already inserted keeps flowing around it).
+3. Keep speaking.
+4. Press the hotkey again when you are done.
+
+Also available: **push-to-talk** (hold to record, release to insert the full utterance). Streaming is usually smoother in terminals and apps that mishandle held keys.
+
+Typical typing is ~40 WPM for most people and ~75 WPM for professionals ([ref](https://www.medrxiv.org/content/10.1101/2025.05.11.25327386v1.full)); this flow often reaches ~150 WPM on the prose while you still type the irreplaceable tokens by hand.
 
 [![Watch the demo](https://img.youtube.com/vi/fRiqNzupudI/0.jpg)](https://youtu.be/fRiqNzupudI)
+
+### Why you should try it
+
+- **Speak + type in parallel** — the main advantage over OS dictation and one-shot tools: insert speech in chunks while the keyboard stays yours.
+- **Always-visible status** — tray / menu-bar icon for idle, loading, recording, transcribing, error, plus an `EN` / `RU` / `AUTO` language chip; Start/Stop and Quit from the menu.
+- **Two languages that follow the keyboard** — with `language=auto`, allowlists and `enforce_language_from_layout` lock Whisper to the layout at hotkey press for the whole session.
+- **Domain vocabulary** — `custom_terms` bias the decoder while it runs (`hotwords` + `initial_prompt`), not a post-hoc find-and-replace.
+- **Background-friendly** — user service (systemd / launchd), one hotkey, config file; built for ordinary laptops.
 
 ---
 
 ## How it differs from other local dictation tools
 
-Most offline dictation apps are push-to-talk: hold a key, speak, release, and the whole utterance is inserted in one go. That is also what SoupaWhisper does in non-streaming mode. The differences are in the streaming path and in multilingual control.
-
-| Capability | SoupaWhisper | Typical push-to-talk app |
+| Capability | SoupaWhisper | Typical push-to-talk / OS dictation |
 |---|---|---|
-| Text insertion | Chunk by chunk **while you speak**, so you can type a URL or a name by hand mid-dictation and keep talking | Buffered and inserted once, after you stop (a live preview may be shown, but the insertion is still a single paste) |
-| Two-language dictation | `language_allowlist` restricts detection to your languages, and `enforce_language_from_layout` picks the language from the active keyboard layout | One global language, or unconstrained auto-detect that can drift on short utterances |
-| Custom terms | Passed to the decoder as `hotwords` + `initial_prompt`, so the model is biased toward them while transcribing | Usually a find-and-replace pass over the finished text |
-| Control surface | Config file, CLI flags, systemd / launchd unit | GUI app |
-| Batch transcription | Audio and video files to `.srt` / `.txt` | Live dictation only |
+| Text insertion | Chunk by chunk **while you speak** — type a URL or name mid-dictation and keep talking | One paste after you stop (even if a preview was shown live) |
+| Status UI | Tray / menu-bar: mic state, language chip, Start/Stop menu | Often none, or only a brief notification |
+| Two-language dictation | Allowlist + active keyboard layout at hotkey press | One global language, or auto-detect that drifts on short chunks |
+| Custom terms | Bias during transcription | Usually replace after the fact |
+| Control | Tray + config + CLI + user service | Full GUI, or no tray |
 
-What SoupaWhisper does not have yet: a menu bar / tray status icon (see the roadmap below), a model manager, and backends other than faster-whisper.
-
----
-
-## Requirements
-
-- **Python 3.10+**
-- **Poetry** or **uv**
-- **[PyAudio](https://people.csail.mit.edu/hubert/pyaudio/)** — on Linux, install PortAudio via your distro (see table below). On macOS, wheels usually suffice; if `pip` fails to build PyAudio, install PortAudio with Homebrew: `brew install portaudio`.
-
-### Linux
-
-- **X11** (for `xclip`, `xdotool`, notifications on typical setups)
-
-### macOS
-
-- Clipboard and typing use **pbcopy** / **AppleScript** (no X11).
-- **Global hotkeys** need **Accessibility** permission for the app that runs SoupaWhisper (e.g. Terminal or iTerm). Function keys (F10, F12, …) are matched correctly on macOS (virtual key codes vs. `Key.f10` style symbols).
-- **launchd** user **LaunchAgent** is optional (`./install.sh` or `make service-reinstall`); background services **cannot** receive global hotkeys on macOS — use a **foreground** Terminal session for dictation. Use **`--test-keys`** to confirm the configured hotkey is seen (`[MATCH]` when you press it).
-
-### System dependencies by distro (Linux)
-
-| Distro | Install command |
-|--------|-----------------|
-| Ubuntu / Pop!_OS / Debian | `sudo apt install xclip xdotool libnotify-bin portaudio19-dev` |
-| Fedora | `sudo dnf install xclip xdotool libnotify portaudio-devel` |
-| Arch Linux | `sudo pacman -S xclip xdotool libnotify portaudio` |
-| openSUSE | `sudo zypper install xclip xdotool libnotify portaudio-devel` |
+Not yet: a model manager, or backends other than faster-whisper.
 
 ---
 
-## Installation
+## Install
+
+Needs **Python 3.10+**, **Poetry** or **uv**, and PortAudio (Linux packages below; on macOS `brew install portaudio` only if PyAudio fails to build). Linux dictation uses **X11** tools (`xclip`, `xdotool`, notifications).
 
 ```bash
 git clone https://github.com/AlexanderMakarov/soupawhisper-streaming.git
@@ -71,259 +54,95 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer supports **Linux** and **macOS**. On Linux it uses your package manager for system libraries; on macOS it skips that step. It installs Python dependencies (Poetry or uv), creates the config file, and can install a user service — **systemd** on Linux or **launchd** (LaunchAgent) on macOS.
+`install.sh` installs system libraries (Linux), Python deps, copies `config.example.ini` → `~/.config/soupawhisper/config.ini`, and can enable a user service (**systemd** on Linux, **launchd** LaunchAgent on macOS).
 
-### Manual setup
+**Linux packages** (if you skip the installer or need to reinstall):
 
-Install system packages from the table above, then:
+| Distro | Packages |
+|--------|----------|
+| Ubuntu / Pop!_OS / Debian / Mint | `sudo apt install xclip xdotool libnotify-bin portaudio19-dev gir1.2-ayatanaappindicator3-0.1 python3-gi python3-gi-cairo` |
+| Fedora | `sudo dnf install xclip xdotool libnotify portaudio-devel libappindicator-gtk3` |
+| Arch | `sudo pacman -S xclip xdotool libnotify portaudio libayatana-appindicator` |
+| openSUSE | `sudo zypper install xclip xdotool libnotify portaudio-devel` |
+
+**Tray on Linux:** pystray needs a StatusNotifier/AppIndicator host **and** `gi` for the **same** Python that runs SoupaWhisper. Prefer distro Python + `--system-site-packages` (Option A). Without a tray host or `gi`, set `tray_icon = false` or the process exits when the tray is required.
 
 ```bash
-poetry install
-# or
-uv sync
+# Option A (Mint/Ubuntu 24.04): OS Python 3.12 + apt gi
+sudo apt install python3-gi python3-gi-cairo gir1.2-ayatanaappindicator3-0.1 python3.12-dev portaudio19-dev
+uv venv --python /usr/bin/python3.12 --system-site-packages && uv sync
+# Expect: .venv/bin/python -c "import pystray; print(pystray.Icon.__module__)" → pystray._appindicator
 ```
 
-Copy and customize the config:
+Option B (uv/pyenv Python without matching `gi`): build PyGObject into that venv, or use a toolchain that ships GObject packages for that interpreter — there is no pure-PyPI tray path. On GNOME, enable an AppIndicator extension.
+
+**macOS:** clipboard/typing use pbcopy / AppleScript. Grant **Accessibility** to the terminal that runs SoupaWhisper. Background LaunchAgents usually **cannot** receive global hotkeys — run in a **foreground** Terminal for dictation; check with `uv run python dictate.py --test-keys` (`[MATCH]` on your hotkey).
+
+**Manual deps only** (no installer): install the packages above, then `poetry install` or `uv sync`, and `cp config.example.ini ~/.config/soupawhisper/config.ini`.
+
+**GPU (optional):** install cuDNN 9, then `device = cuda` and `compute_type = float16` in config.
+
+---
+
+## Run
 
 ```bash
-mkdir -p ~/.config/soupawhisper
-cp config.example.ini ~/.config/soupawhisper/config.ini
+make run            # config default
+make run-stream     # streaming
+make run-no-stream  # push-to-talk
+make run-file F=path/to/audio.wav
+make transcribe F=path/to/video.mov   # needs ffmpeg → writes .srt next to the file (EXT=txt for plain text)
+make test
 ```
 
-### Language (English, Spanish, Russian, auto-detect)
+`make` picks Poetry or uv. Equivalents: `uv run python dictate.py` / `poetry run python dictate.py`, with `--streaming` / `--no-streaming` / `--verbose` as needed. Hotkey default is **F12**. Ctrl+C quits a foreground process.
 
-Whisper uses [ISO 639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) language codes (`en`, `es`, `ru`, …). **Any language other than English-only dictation requires a multilingual model** — names **without** the `.en` suffix (for example `base`, not `base.en`). Models ending in `.en` transcribe English only.
+### User service
 
-**English (optimized):** default config often uses `model = base.en` and `language = en`.
-
-**Spanish (or another single language):** set the code and a multilingual model, for example:
-
-```ini
-[whisper]
-model = base
-language = es
+```bash
+make service-reinstall   # or choose 'y' during ./install.sh
+make service-start | service-stop | service-restart | service-status | service-logs
 ```
 
-Transcription is emitted in that language’s script (e.g. Cyrillic for Russian). The focused app must accept that text (system keyboard/layout or IME as needed).
+Same targets map to `systemctl --user` (Linux) or the LaunchAgent / `~/Library/Logs/soupawhisper.log` (macOS). Reminder: on macOS, global hotkeys generally need a foreground run, not the agent.
 
-**Several languages in one session** (mixed speech or switching): use auto-detect and a multilingual model:
+---
 
-```ini
-[whisper]
-model = base
-language = auto
-```
+## Configuration
 
-**English and Russian only** (auto-detect, but never Hindi, German, etc.): with `language = auto`, Whisper can mis-guess the language on very short or noisy audio (for example while filling subscription fields). Restrict detection to a small set:
+Edit `~/.config/soupawhisper/config.ini` (comments in the file are authoritative). Highlights:
+
+**Language** — ISO 639-1 codes. Non-English or `auto` needs a **multilingual** model (name **without** `.en`, e.g. `base`). English-only: `base.en` + `language = en`. Mixed / bilingual:
 
 ```ini
 [whisper]
 model = base
 language = auto
 language_allowlist = en, ru
-```
 
-SoupaWhisper runs language detection once per utterance, keeps only the languages you list, and transcribes using the highest-scoring one among them—so output stays in Latin or Cyrillic from those two choices instead of drifting into another language.
-
-**Optional: enforce auto-detect using current keyboard layout (best for `en, ru`)**: if you have `language = auto` + `language_allowlist = en, ru`, you can also tell SoupaWhisper to pick the language based on your **current OS keyboard layout/input source** (Latin vs Cyrillic). This language is captured **once when you start dictation** (hotkey press) and used for the whole dictation session (no re-checks mid-stream).
-
-```ini
 [behavior]
 enforce_language_from_layout = true
-layout_to_language = com.apple.keylayout.US:en, com.apple.keylayout.Russian:ru, us:en, ru:ru
+layout_to_language = us:en, ru:ru, com.apple.keylayout.US:en, com.apple.keylayout.Russian:ru
 ```
 
-#### How `layout_to_language` works
+Layout language is captured **once at hotkey press** for the session. On Linux, active layout uses `xkb-switch` / `xkblayout-state` if present, else X11 `XkbGetState` + `setxkbmap`. Map `us` → `en`. Allowlist detection still runs Whisper’s normal language scores and **filters** them — not a second full decode; one language in config/allowlist skips detect entirely.
 
-- **Format**: comma-separated `<layout_id>:<iso639-1>` pairs (no spaces inside the id).
-- **Allowed values**: any two-letter ISO 639-1 codes Whisper supports (for example `en`, `ru`, `es`, `de`).
-- **Interaction with `language_allowlist`**: if `language_allowlist` is set, the enforced language must be included (otherwise the allowlist wins and normal detection is used).
+**Custom terms** — `custom_terms = Claude, Kubernetes, GraphQL` (comma or newlines; hint to the decoder, not a guarantee).
 
-#### How to find the right `layout_id`
+**Streaming noise rejects** — `reject_phrases = thank you, thanks, okay` skips a chunk only when the whole chunk equals a phrase (punctuation ignored).
 
-- **macOS (recommended)**
-  - The app reads the current input source id from `com.apple.HIToolbox` (selected input sources).
-    Quick way to see the current `InputSourceID`:
+**Tray** — `tray_icon = true`, `tray_show_language = true` (on-icon chip; idle stays `AUTO` with `language=auto` until a session starts). Fail-hard if tray cannot start; set `tray_icon = false` for headless.
 
-    ```bash
-    defaults export com.apple.HIToolbox - | python3 -c 'import sys, plistlib; d=plistlib.loads(sys.stdin.buffer.read()); sel=d.get("AppleSelectedInputSources") or []; print((sel[0] or {}).get("InputSourceID",""))'
-    ```
-  - Example outputs:
-    - `com.apple.keylayout.US`
-    - `com.apple.keylayout.Russian`
-    - `com.apple.keylayout.ABC`
+**Audio device** — `--verbose` lists devices; set `audio_input_device` under `[streaming]` to an index or partial name.
 
-  Start with a minimal mapping:
+### Modes (behavior)
 
-  ```ini
-  [behavior]
-  enforce_language_from_layout = true
-  layout_to_language = com.apple.keylayout.US:en, com.apple.keylayout.ABC:en, com.apple.keylayout.Russian:ru
-  ```
+| Mode | Flag / config | What happens |
+|------|----------------|--------------|
+| **Streaming** | `--streaming` / `default_streaming = true` | Press hotkey to start, press again to stop. Silence (VAD) splits speech into chunks; each chunk is transcribed and inserted as you go — this is the speak+type flow. |
+| **Non-streaming (push-to-talk)** | `--no-streaming` / `default_streaming = false` | Hold hotkey to record, release to transcribe the whole buffer once, then clipboard + type. Better for short precise utterances; held keys can misbehave in some terminals/apps. |
 
-  If you want to see which languages macOS associates with each input source (what SoupaWhisper uses as a fallback when no explicit mapping matches), run:
-
-  ```bash
-  defaults export com.apple.HIToolbox - | python3 -c '
-import sys, plistlib
-d = plistlib.loads(sys.stdin.buffer.read())
-items = (d.get("AppleSelectedInputSources") or []) + (d.get("AppleInputSourceHistory") or [])
-for it in items:
-    if isinstance(it, dict) and "InputSourceID" in it:
-        print(it.get("InputSourceID"), it.get("InputSourceLanguages"))
-'
-  ```
-
-- **Linux/X11**
-  - To reliably detect the **active** layout group, install one of:
-    - `xkb-switch`
-    - `xkblayout-state`
-  - Your `layout_id` values are typically short XKB tokens like `us`, `ru`, `de`.
-
-  Example mapping:
-
-  ```ini
-  [behavior]
-  enforce_language_from_layout = true
-  layout_to_language = us:en, ru:ru
-  ```
-
-  If you don’t have `xkb-switch` / `xkblayout-state`, this feature can’t reliably determine the active layout and will do nothing.
-
-**Does this add a “second heavy” model pass?** Whisper’s CTranslate2 backend does not let you restrict the language classifier to a subset of ISO codes; it always produces scores for every language token. We reuse that same vector and only **filter** it to your allowlist—there is no lighter instruction path inside the model. The expensive step is the **text decoder** (autoregressive), and that still runs **once** per chunk. The extra work for `en, ru` is one **encoder + language head** pass via `detect_language`, which is small next to decoding. If you only need **one** language, set `language = ru` (or put a single code in `language_allowlist`) so detection is skipped entirely.
-
-**Spanish or other languages** forced to one language: same pattern as Russian — `language = es` (etc.) and a non-`*.en` `model`.
-
-### GPU support (optional)
-
-For NVIDIA GPU acceleration, install cuDNN 9 and set in `~/.config/soupawhisper/config.ini`:
-
-```ini
-device = cuda
-compute_type = float16
-```
-
-(See [NVIDIA cuDNN](https://developer.nvidia.com/cudnn) for package instructions for your distro.)
-
----
-
-## Usage
-
-**Recommended:** use the Makefile (auto-picks Poetry or uv):
-
-```bash
-make run           # default mode (config-driven)
-make run-stream    # streaming
-make run-no-stream # non-streaming
-make run-file F=path/to/audio.wav   # transcribe a file
-make transcribe F=path/to/video.mov # transcribe a video/audio file into subtitles next to it (requires ffmpeg)
-```
-
-`make transcribe` extracts the audio with ffmpeg (any format ffmpeg supports: .mov, .mp4, .mp3, ...) and writes `path/to/video.srt` with timestamps. Pass `EXT=txt` for plain text without timestamps.
-
-Or run directly:
-
-```bash
-poetry run python dictate.py
-# or
-uv run python dictate.py
-```
-
-Add `--streaming` or `--no-streaming` to override config. Use `--verbose` to list audio devices.
-
-### Behavior
-
-- **Hotkey** (default **F12**): start/stop recording (or hold for push-to-talk in non-streaming).
-- **Non-streaming:** release hotkey → full recording is transcribed, then text is copied and typed into the focused field.
-- **Streaming:** press hotkey again to stop; text is emitted in chunks as silence is detected.
-- **Ctrl+C** quits when run in the foreground.
-
-### Custom terms / glossary
-
-Whisper sometimes mishears domain-specific words (`Claude` → `cloud`) or rare phrases (`ML repository` → `a male repository`). You can give it a glossary of custom terms — names, brands, acronyms, technical vocabulary — that it should prefer. The list is passed to faster-whisper as both **`initial_prompt`** (in-context priming) and **`hotwords`** (decoder logit bias), so it works in **streaming and non-streaming modes**.
-
-```ini
-[behavior]
-custom_terms = Claude, Kubernetes, GraphQL, ML repository
-```
-
-- Comma-separated; multi-word phrases are fine. Newlines also work as separators.
-- Case is preserved (Whisper is case-sensitive for many terms).
-- Leave empty / unset to disable.
-- This is a **hint**, not a guarantee. Strongly mismatched audio can still produce other words.
-- Subject to Whisper's ~224-token prompt cap; very long glossaries are silently truncated by the decoder.
-
-### Streaming: reject specific noise phrases
-
-Whisper can sometimes output short “filler” phrases from noise (coughs, mic bumps, etc.). In **streaming mode only**, you can configure a list of phrases to suppress.
-
-- A chunk is skipped only if it **exactly equals** one configured phrase, ignoring punctuation (so `thank you`, `thank you.` and `THANK YOU!!!` are treated the same).
-- If the chunk contains **anything else** (multiple phrases, extra words), it is **not** rejected.
-- If `reject_phrases` is empty/unset, the feature is **disabled** and all chunks are emitted as-is.
-- When a chunk is skipped, SoupaWhisper logs an info line: `[reject] Skipping chunk (matched reject phrase): ...`
-
-Config example:
-
-```ini
-[behavior]
-reject_phrases = thank you, thanks, okay, ok, um, hmm
-```
-
-### Modes
-
-| Mode | Flag / config | Best for |
-|------|----------------|----------|
-| **Non-streaming** | `--no-streaming` or `default_streaming = false` | Short, precise dictation; full-sentence accuracy. |
-| **Streaming** | `--streaming` or `default_streaming = true` | Longer dictation; text appears incrementally after short pauses. |
-
----
-
-## Run as a background service
-
-You can run SoupaWhisper as a **user service** so it starts at login: **systemd** on Linux, **launchd** on macOS. The same `make service-*` targets work on both; they call `systemctl` or `launchctl` as appropriate.
-
-If you didn’t enable the service during install:
-
-```bash
-./install.sh   # choose 'y' when prompted (systemd on Linux, LaunchAgent on macOS)
-```
-
-Or reinstall only the service (Python deps already installed):
-
-```bash
-make service-reinstall
-```
-
-**Service commands** (Linux → `systemctl`; macOS → LaunchAgent at `~/Library/LaunchAgents/com.soupawhisper.dictate.plist`, logs at `~/Library/Logs/soupawhisper.log`):
-
-```bash
-make service-start
-make service-stop
-make service-restart
-make service-status
-make service-logs     # Linux: journalctl; macOS: tail -f ~/Library/Logs/soupawhisper.log
-```
-
-**Linux (manual systemd):**
-
-```bash
-systemctl --user start soupawhisper
-systemctl --user stop soupawhisper
-journalctl --user -u soupawhisper -f
-```
-
----
-
-## Configuration
-
-Edit `~/.config/soupawhisper/config.ini`. Options are documented in the file.
-
-### Audio input device
-
-Recording uses PyAudio. To choose the input device:
-
-1. Run with `--verbose` to print available input devices and indices.
-2. In `config.ini`, under `[streaming]`, set `audio_input_device` to a device index (e.g. `0`) or a partial name (e.g. `"pulse"`, `"HDA Intel"`). Leave unset to use the system default.
+Default hotkey is **F12** (configurable). Ctrl+C quits a foreground process.
 
 ---
 
@@ -333,46 +152,46 @@ Recording uses PyAudio. To choose the input device:
 
 - Run with `--verbose` and check the listed input devices.
 - Set `audio_input_device` in config to the correct index or name.
-- Ensure the microphone works in system settings and isn’t muted.
+- Ensure the microphone works in system settings and is not muted.
 
-**Keyboard / permissions**
+**Bad transcription / suspect the mic, not the model**
 
-- **Linux:** Add your user to the `input` group so the app can read the keyboard:
-  ```bash
-  sudo usermod -aG input $USER
-  # Log out and back in.
-  ```
-- **macOS – hotkey (e.g. F10) does nothing:**
-  1. **Run in the foreground:** Start the app from Terminal (`uv run python dictate.py` or `make run`) so it can receive key events. The launchd service runs in the background and on macOS typically cannot receive global hotkeys.
-  2. **Grant Accessibility:** Open **System Settings → Privacy & Security → Accessibility** and add **Terminal** (or iTerm / the app you use to run the command). Restart Terminal after adding.
-  3. **Function keys:** If you use F10/F12 etc., ensure **System Settings → Keyboard → "Use F1, F2, etc. keys as standard function keys"** is enabled, or hold **Fn** when pressing F10 so the key is sent as F10 and not as a special key (e.g. mute).
-  4. **Verify key is seen:** Run `uv run python dictate.py --test-keys` (or `poetry run python dictate.py --test-keys`). Press your hotkey (e.g. F10); you should see a line with `[MATCH]`. Press Ctrl+C to exit. If no key events appear, the app is not receiving keyboard input (permissions or run context).
-  5. If you see a pynput warning about "This process is not trusted" or "Input event monitoring will not be possible", add your terminal app (Terminal, iTerm, etc.) to **System Settings → Privacy & Security → Accessibility**, then restart the app.
+Enable persistent capture, dictate briefly, then listen:
+
+```ini
+[behavior]
+save_recordings = true
+```
+
+Files land under `/tmp`: `recording_YYYYMMDD_HHMMSS.wav` (non-streaming) or `stream_chunk_YYYYMMDD_HHMMSS.wav` (one per streaming chunk). Disable `save_recordings` when finished debugging.
+
+**Linux: hotkey does nothing**
+
+Add your user to the `input` group, then log out and back in:
+
+```bash
+sudo usermod -aG input $USER
+```
+
+**macOS: hotkey (e.g. F10/F12) does nothing**
+
+1. Run in the **foreground** from Terminal (`make run` / `uv run python dictate.py`). The launchd agent usually cannot receive global hotkeys.
+2. **System Settings → Privacy & Security → Accessibility** — add Terminal (or iTerm / the app you use), then restart it.
+3. Prefer **Use F1, F2, etc. as standard function keys**, or hold **Fn** so F-keys are not media keys.
+4. Verify with `--test-keys` (below). A “process is not trusted” / monitoring warning means Accessibility is still missing.
 
 **Hotkey debugging (`--test-keys`)**
-
-To check whether your configured hotkey is detected at all, run:
 
 ```bash
 uv run python dictate.py --test-keys
 # or: poetry run python dictate.py --test-keys
 ```
 
-The app will print every key press and mark the configured hotkey with `[MATCH]`. Press keys (e.g. F10) and confirm you see the match; press Ctrl+C to exit. If keys never appear, the process is not receiving keyboard input (on macOS: add your terminal to Accessibility and run in the foreground).
+Every key press is printed; the configured hotkey is marked `[MATCH]`. Ctrl+C exits. If nothing appears, the process is not receiving keyboard input (permissions or background launch on macOS).
 
-**Bad transcription quality**
+**Tray icon missing (Linux)**
 
-To verify what is being captured (e.g. wrong device, silence, or bad quality), enable persistent recordings in config and listen to the files:
-
-- In `~/.config/soupawhisper/config.ini`, under `[behavior]`, set:
-  ```ini
-  save_recordings = true
-  ```
-- Run a short dictation. Recordings are written under `/tmp`:
-  - Non-streaming: `recording_YYYYMMDD_HHMMSS.wav`
-  - Streaming: `stream_chunk_YYYYMMDD_HHMMSS.wav` (one file per speech chunk)
-- Play a file to hear how it sounds. Often issues are in the recording, not the transcription model.
-- Set `save_recordings = false` when you are done debugging.
+Confirm AppIndicator backend (`pystray._appindicator`, not `_xorg`), a panel StatusNotifier / AppIndicator host, and `gi` for this Python (see Install Option A). Or set `tray_icon = false`.
 
 **cuDNN / GPU errors**
 
@@ -382,37 +201,17 @@ If you see errors about `libcudnn_ops.so.9`, install cuDNN 9 for your CUDA versi
 
 ## Model sizes
 
-Sizes are approximate. **English-only** models (`*.en`) are a bit better for English-only dictation. **Multilingual** models (same size tier, name **without** `.en`: `tiny`, `base`, `small`, `medium`, `large-v3`) are required for Russian, other non-English languages, or `language = auto`.
+English-only `*.en` models are slightly better for English-only work. Multilingual names omit `.en`.
 
-| Model      | Scope           | Size   | Speed   | Accuracy |
+| Model | Scope | Size | Speed | Accuracy |
 | ---------- | --------------- | ------ | ------- | -------- |
-| tiny.en    | English only    | ~75MB  | Fastest | Basic    |
-| base.en    | English only    | ~150MB | Fast    | Good     |
-| small.en   | English only    | ~500MB | Medium  | Better   |
-| medium.en  | English only    | ~1.5GB | Slower  | Great    |
-| tiny       | Multilingual    | ~75MB  | Fastest | Basic    |
-| base       | Multilingual    | ~150MB | Fast    | Good     |
-| small      | Multilingual    | ~500MB | Medium  | Better   |
-| medium     | Multilingual    | ~1.5GB | Slower  | Great    |
-| large-v3   | Multilingual    | ~3GB   | Slowest | Best     |
+| tiny.en / tiny | EN-only / multi | ~75MB | Fastest | Basic |
+| base.en / base | EN-only / multi | ~150MB | Fast | Good |
+| small.en / small | EN-only / multi | ~500MB | Medium | Better |
+| medium.en / medium | EN-only / multi | ~1.5GB | Slower | Great |
+| large-v3 | Multilingual | ~3GB | Slowest | Best |
 
-For **English-only** streaming dictation, `base.en` or `small.en` is usually the best tradeoff. For **Russian or multilingual** use, prefer `base` / `small` / `medium` / `large-v3` (no `.en`) and set `language` as in [Language](#language-english-spanish-russian-auto-detect) above. Larger models are much slower; improving quality often starts with a better microphone.
-
----
-
-## Testing
-
-```bash
-make test
-```
-
-Or:
-
-```bash
-poetry run pytest dictate_tests.py
-# or
-uv run pytest dictate_tests.py
-```
+For English streaming, `base.en` or `small.en` is usually enough. For Russian / bilingual / `auto`, use `base`+ without `.en`. Larger models are much slower; mic quality often matters more.
 
 ---
 
@@ -422,7 +221,7 @@ uv run pytest dictate_tests.py
 - [x] Streaming: fixes for voice duplication, race conditions, and skipped segments; corrected transcriber duration reporting.
 - [x] Multiple languages support.
 - [x] Support list of custom terms or pronunciation features (like accents or speech patterns).
-- [ ] Status icon in the menu bar / system tray, so it is always visible when the microphone is live.
+- [x] Status icon in the menu bar / system tray, so it is always visible when the microphone is live.
 - [ ] Option to reuse previous transcription as context (e.g. `initial_prompt`).
 - [ ] Context from a first word (e.g. “Python” → prompt about Python without "Python" in the output).
 - [ ] Expose more `model.transcribe()` options in config.

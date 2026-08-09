@@ -276,23 +276,107 @@ def _macos_input_source_languages_for_id(input_source_id: str) -> Optional[list[
     return None
 
 
+def _linux_xkb_layouts_from_setxkbmap() -> Optional[list[str]]:
+    """Ask setxkbmap for the configured layout list."""
+    if subprocess.run(["which", "setxkbmap"], capture_output=True).returncode != 0:
+        return None
+    out = _run_cmd(["setxkbmap", "-query"], timeout_s=0.8)
+    return parse_setxkbmap_layouts(out)
+
+
+def parse_setxkbmap_layouts(query_text: Optional[str]) -> Optional[list[str]]:
+    """Parse `setxkbmap -query` output into layout tokens (e.g. us,ru,am -> ['us','ru','am'])."""
+    if not query_text:
+        return None
+    for line in query_text.splitlines():
+        if line.strip().startswith("layout:"):
+            raw = line.split("layout:", 1)[1].strip()
+            layouts = [p.strip() for p in raw.split(",") if p.strip()]
+            return layouts or None
+    return None
+
+
+def _linux_xkb_group_index() -> Optional[int]:
+    """Current XKB group index via libX11 XkbGetState (no extra packages)."""
+    try:
+        import ctypes
+        import ctypes.util
+
+        lib_name = ctypes.util.find_library("X11")
+        if not lib_name:
+            return None
+        x11 = ctypes.CDLL(lib_name)
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.restype = ctypes.c_int
+
+        class XkbStateRec(ctypes.Structure):
+            _fields_ = [
+                ("group", ctypes.c_ubyte),
+                ("locked_group", ctypes.c_ubyte),
+                ("base_group", ctypes.c_ushort),
+                ("latched_group", ctypes.c_ushort),
+                ("mods", ctypes.c_ubyte),
+                ("base_mods", ctypes.c_ubyte),
+                ("latched_mods", ctypes.c_ubyte),
+                ("locked_mods", ctypes.c_ubyte),
+                ("compat_state", ctypes.c_ubyte),
+                ("grab_mods", ctypes.c_ubyte),
+                ("compat_grab_mods", ctypes.c_ubyte),
+                ("lookup_mods", ctypes.c_ubyte),
+                ("compat_lookup_mods", ctypes.c_ubyte),
+                ("ptr_buttons", ctypes.c_ushort),
+            ]
+
+        x11.XkbGetState.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(XkbStateRec)]
+        x11.XkbGetState.restype = ctypes.c_int
+
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return None
+        try:
+            state = XkbStateRec()
+            # XkbUseCoreKbd; Status Success == 0
+            status = x11.XkbGetState(dpy, 0x0100, ctypes.byref(state))
+            if status != 0:
+                return None
+            return int(state.group)
+        finally:
+            x11.XCloseDisplay(dpy)
+    except Exception as e:
+        logger.debug("XkbGetState failed: %s", e)
+        return None
+
+
+def _which_ok(name: str) -> bool:
+    return subprocess.run(["which", name], capture_output=True).returncode == 0
+
+
 def _linux_active_xkb_layout() -> Optional[str]:
     """
     Try to detect the *active* XKB layout (current group), not just the configured list.
 
     Returns a single layout token like "us" or "ru" when possible.
+    Order: xkb-switch, xkblayout-state, then setxkbmap list + XkbGetState.
     """
-    # Best: xkb-switch prints current layout (if installed).
-    if subprocess.run(["which", "xkb-switch"], capture_output=True).returncode == 0:
+    if _which_ok("xkb-switch"):
         out = _run_cmd(["xkb-switch", "-p"], timeout_s=0.5) or _run_cmd(["xkb-switch"], timeout_s=0.5)
         if out:
             return out.strip()
-    # Alternative: xkblayout-state (if installed).
-    if subprocess.run(["which", "xkblayout-state"], capture_output=True).returncode == 0:
+    if _which_ok("xkblayout-state"):
         out = _run_cmd(["xkblayout-state", "print", "%s"], timeout_s=0.5)
         if out:
             return out.strip()
-    return None
+    layouts = _linux_xkb_layouts_from_setxkbmap()
+    if not layouts:
+        return None
+    if len(layouts) == 1:
+        return layouts[0]
+    idx = _linux_xkb_group_index()
+    if idx is None or idx < 0 or idx >= len(layouts):
+        return None
+    return layouts[idx]
 
 
 def detect_current_keyboard_language(layout_to_language: dict[str, str]) -> Optional[str]:
@@ -302,7 +386,7 @@ def detect_current_keyboard_language(layout_to_language: dict[str, str]) -> Opti
     Priority:
     1) Explicit config mapping (layout_to_language) for the detected layout/source id
     2) macOS: read InputSourceLanguages for the active InputSourceID (HIToolbox)
-    3) Linux/X11: read active XKB layout (requires xkb-switch/xkblayout-state); return if it looks like ISO 639-1
+    3) Linux/X11: read active XKB layout (xkb-switch, xkblayout-state, or X11 XkbGetState); return if mapped or ISO 639-1
     """
     def looks_like_iso_639_1(s: str) -> bool:
         return len(s) == 2 and s.isalpha()
@@ -391,6 +475,9 @@ def load_config():
         "enforce_language_from_layout": config.getboolean("behavior", "enforce_language_from_layout", fallback=False),
         # Comma-separated list: "<layout_id>:<lang>,<layout_id>:<lang>"
         "layout_to_language": config.get("behavior", "layout_to_language", fallback="").strip(),
+        # Menu bar / system tray (default on; if true and tray cannot start, process exits)
+        "tray_icon": config.getboolean("behavior", "tray_icon", fallback=True),
+        "tray_show_language": config.getboolean("behavior", "tray_show_language", fallback=True),
         # Streaming
         "min_speech_length_seconds": config.getfloat("streaming", "min_speech_length_seconds", fallback=1.0),
         "vad_silence_threshold_seconds": config.getfloat("streaming", "vad_silence_threshold_seconds", fallback=1.0),
@@ -544,9 +631,12 @@ class Dictation:
         hv = self._hotkey_value
         self._hotkey_vk = getattr(hv, "vk", None) if hv is not None else getattr(self.hotkey, "vk", None)
         self.recording = False
+        self.transcribing = False
         self.model = None
         self.model_loaded = threading.Event()
         self.model_error = None
+        self._tray_error = None
+        self._tray = None
         self.running = True
         self.typer: Optional[Typer] = None
         self.audio_interface: Optional[pyaudio.PyAudio] = None
@@ -563,6 +653,8 @@ class Dictation:
         self._last_hotkey_event_monotonic: Optional[float] = None
         self._hotkey_action_in_progress_since: Optional[float] = None
         self._hotkey_action_in_progress_name: Optional[str] = None
+        self._keyboard_listener = None
+        self._listener_restart_backoff_s = 1.0
 
         custom_terms = _parse_custom_terms(self.config.get("custom_terms") or "")
         self._custom_terms_kwargs = _build_custom_terms_kwargs(custom_terms)
@@ -801,21 +893,27 @@ class Dictation:
 
     def _maybe_enforced_language_for_field(self) -> Optional[str]:
         """
-        If enabled, infer expected language from current OS keyboard layout.
-        Intended to help when using `language=auto` with allowlists (e.g. en,ru) and the
-        focused field expects one script (URL/email -> EN, chat -> RU, etc.).
+        Return the language captured at session start when layout enforcement is on.
+
+        Captured once in start_recording (hotkey press) and cleared when the session ends,
+        so idle tray shows AUTO again and the next hotkey re-reads the current layout.
         """
-        # Enforced language is captured once on start_recording (hotkey press) and reused until stop.
-        if self._session_enforced_language:
-            return self._session_enforced_language
         if not self.config.get("enforce_language_from_layout", False):
             return None
-        return None
+        return self._session_enforced_language
+
+    def _begin_session_language(self) -> None:
+        """Capture layout language for this dictation session (hotkey / Start)."""
+        self._capture_session_enforced_language()
+
+    def _end_session_language(self) -> None:
+        """Clear session language so idle UI returns to AUTO / configured language."""
+        self._clear_session_enforced_language()
 
     def _capture_session_enforced_language(self) -> None:
         """
-        Capture current "field expectation" language once at the start of a dictation session.
-        This intentionally does NOT re-check during a running streaming session for performance and determinism.
+        Capture current field-expectation language once at the start of a dictation session.
+        Does not re-check during a running session (determinism + fewer layout queries).
         """
         self._session_enforced_language = None
         if not self.config.get("enforce_language_from_layout", False):
@@ -835,6 +933,33 @@ class Dictation:
         if lang:
             self._session_enforced_language = lang
             logger.debug("[lang/layout] captured=%s", lang)
+
+    def _clear_session_enforced_language(self) -> None:
+        self._session_enforced_language = None
+
+    def _stop_tray(self) -> None:
+        tray = getattr(self, "_tray", None)
+        if tray is None:
+            return
+        try:
+            tray.stop()
+        except Exception as e:
+            logger.debug("tray.stop() failed: %s", e)
+
+    def _start_tray_or_exit(self):
+        """Prepare the tray icon or exit non-zero when tray_icon is required."""
+        from tray_status import TrayStartError, TrayStatus
+
+        try:
+            tray = TrayStatus(self)
+            tray.prepare()
+            return tray
+        except TrayStartError as e:
+            logger.error("Tray icon required but failed to start: %s", e)
+            raise SystemExit(1) from e
+        except Exception as e:
+            logger.error("Tray icon required but failed to start: %s", e, exc_info=True)
+            raise SystemExit(1) from e
 
     def _transcribe_audio_array(self, audio_array: np.ndarray) -> Tuple[str, float]:
         """
@@ -955,29 +1080,38 @@ class Dictation:
         # Stop the keyboard listener to release X11 grabs
         if hasattr(self, '_keyboard_listener') and self._keyboard_listener:
             self._keyboard_listener.stop()
+        self._stop_tray()
 
-    def run(self):
-        def start_listener() -> keyboard.Listener:
-            listener = keyboard.Listener(
-                on_press=self.on_press,
-                on_release=self.on_release,
-            )
-            listener.daemon = True
-            listener.start()
-            self._keyboard_listener = listener
-            return listener
+    def _create_hotkey_listener(self) -> keyboard.Listener:
+        listener = keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+        )
+        listener.daemon = True
+        return listener
 
-        if self.config.get("notifications"):
-            self.notify(
-                "SoupaWhisper running",
-                f"Hold {self.get_hotkey_name().upper()} to record, release to transcribe.",
-                logging.INFO,
-                1500,
-                "dialog-information",
-            )
+    def _start_hotkey_listener(self) -> keyboard.Listener:
+        listener = self._create_hotkey_listener()
+        listener.start()
+        self._keyboard_listener = listener
+        return listener
 
+    def restart_hotkey_listener(self) -> None:
+        """Stop and start the pynput listener (menu / supervisor recovery)."""
+        old = getattr(self, "_keyboard_listener", None)
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                pass
+        time.sleep(self._listener_restart_backoff_s)
+        self._start_hotkey_listener()
+        self._listener_restart_backoff_s = 1.0
+        logger.info("[hotkey] Listener restarted")
+
+    def _run_supervisor_loop(self) -> None:
         try:
-            listener = start_listener()
+            self._start_hotkey_listener()
         except Exception as e:
             exe = sys.executable
             logger.error("[hotkey] Failed to start keyboard listener: %s", e, exc_info=True)
@@ -994,29 +1128,20 @@ class Dictation:
             raise
 
         last_heartbeat = 0.0
-        restart_backoff_s = 1.0
         while self.running:
             time.sleep(0.2)
             now = time.monotonic()
             if now - last_heartbeat >= 30.0:
                 last_heartbeat = now
-                last_hotkey_age = None
                 if self._last_hotkey_event_monotonic is not None:
-                    last_hotkey_age = now - self._last_hotkey_event_monotonic
+                    _ = now - self._last_hotkey_event_monotonic
 
-            # If listener stops unexpectedly, restart and log loudly.
-            if getattr(listener, "running", True) is False:
+            listener = self._keyboard_listener
+            if listener is not None and getattr(listener, "running", True) is False:
                 try:
-                    # Best-effort stop old listener (may already be stopped).
-                    try:
-                        listener.stop()
-                    except Exception:
-                        pass
-                    time.sleep(restart_backoff_s)
-                    listener = start_listener()
-                    restart_backoff_s = 1.0
+                    self.restart_hotkey_listener()
                 except Exception as e:
-                    restart_backoff_s = min(30.0, restart_backoff_s * 2.0)
+                    self._listener_restart_backoff_s = min(30.0, self._listener_restart_backoff_s * 2.0)
                     logger.error("[hotkey] Listener restart failed: %s", e, exc_info=True)
                     if self.config.get("notifications"):
                         self.notify(
@@ -1030,9 +1155,34 @@ class Dictation:
                         )
 
         try:
-            listener.stop()
+            if self._keyboard_listener:
+                self._keyboard_listener.stop()
         except Exception:
             pass
+
+    def _startup_notification(self) -> None:
+        if self.config.get("notifications"):
+            self.notify(
+                "SoupaWhisper running",
+                f"Hold {self.get_hotkey_name().upper()} to record, release to transcribe.",
+                logging.INFO,
+                1500,
+                "dialog-information",
+            )
+
+    def run(self):
+        self._startup_notification()
+        if self.config.get("tray_icon", True):
+            tray = self._start_tray_or_exit()
+            self._tray = tray
+            threading.Thread(
+                target=self._run_supervisor_loop,
+                daemon=True,
+                name="hotkey_supervisor",
+            ).start()
+            tray.run_blocking()
+            return
+        self._run_supervisor_loop()
 
     def _audio_recording_worker(self):
         """Audio recording worker thread that collects audio data into one array."""
@@ -1058,7 +1208,7 @@ class Dictation:
             return
 
         # Capture enforced language once for this session (hotkey press).
-        self._capture_session_enforced_language()
+        self._begin_session_language()
 
         self.recording = True
         self.audio_data = []
@@ -1066,6 +1216,7 @@ class Dictation:
         self.audio_stream = self._start_pyaudio_stream(self.frames_per_buffer)
         if self.audio_stream is None:
             self.recording = False
+            self._end_session_language()
             return
 
         self.audio_thread = threading.Thread(
@@ -1081,6 +1232,7 @@ class Dictation:
             return
 
         self.recording = False
+        self.transcribing = True
 
         if self.audio_thread:
             self.audio_thread.join(timeout=2.0)
@@ -1141,8 +1293,11 @@ class Dictation:
         except Exception as e:
             logger.error(f"Error transcribing: {e}", exc_info=True)
             self.notify("Error", str(e)[:50], logging.ERROR, 3000)
+            self._tray_error = str(e)
         finally:
             self.audio_data = []
+            self.transcribing = False
+            self._end_session_language()
 
     def transcribe_file(self, wav_file_path: str) -> str:
         """
@@ -1291,6 +1446,21 @@ class StreamingDictation(Dictation):
     def _finish_model_loading(self):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
+    def _create_hotkey_listener(self) -> keyboard.Listener:
+        listener = keyboard.Listener(on_press=self.on_press)
+        listener.daemon = True
+        return listener
+
+    def _startup_notification(self) -> None:
+        if self.config.get("notifications"):
+            self.notify(
+                "SoupaWhisper running",
+                f"Press {self.get_hotkey_name().upper()} to start/stop streaming transcription.",
+                logging.INFO,
+                1500,
+                "dialog-information",
+            )
+
     def on_press(self, key):
         try:
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
@@ -1301,79 +1471,6 @@ class StreamingDictation(Dictation):
                     self._schedule_hotkey_action(self.stop_recording, "stop_recording")
         except Exception as e:
             logger.error("[hotkey] on_press failed: %s", e, exc_info=True)
-
-    def run(self):
-        def start_listener() -> keyboard.Listener:
-            listener = keyboard.Listener(on_press=self.on_press)
-            listener.daemon = True
-            listener.start()
-            self._keyboard_listener = listener
-            return listener
-
-        if self.config.get("notifications"):
-            self.notify(
-                "SoupaWhisper running",
-                f"Press {self.get_hotkey_name().upper()} to start/stop streaming transcription.",
-                logging.INFO,
-                1500,
-                "dialog-information",
-            )
-
-        try:
-            listener = start_listener()
-        except Exception as e:
-            exe = sys.executable
-            logger.error("[hotkey] Failed to start keyboard listener: %s", e, exc_info=True)
-            if self.config.get("notifications"):
-                self.notify(
-                    "Hotkey listener failed",
-                    "SoupaWhisper could not listen for global hotkeys.\n\n"
-                    "On macOS, this usually means missing Accessibility / Input Monitoring permission "
-                    f"for the running executable:\n{exe}",
-                    logging.ERROR,
-                    10000,
-                    "dialog-error",
-                )
-            raise
-
-        last_heartbeat = 0.0
-        restart_backoff_s = 1.0
-        while self.running:
-            time.sleep(0.2)
-            now = time.monotonic()
-            if now - last_heartbeat >= 30.0:
-                last_heartbeat = now
-                last_hotkey_age = None
-                if self._last_hotkey_event_monotonic is not None:
-                    last_hotkey_age = now - self._last_hotkey_event_monotonic
-
-            if getattr(listener, "running", True) is False:
-                try:
-                    try:
-                        listener.stop()
-                    except Exception:
-                        pass
-                    time.sleep(restart_backoff_s)
-                    listener = start_listener()
-                    restart_backoff_s = 1.0
-                except Exception as e:
-                    restart_backoff_s = min(30.0, restart_backoff_s * 2.0)
-                    logger.error("[hotkey] Listener restart failed: %s", e, exc_info=True)
-                    if self.config.get("notifications"):
-                        self.notify(
-                            "Hotkey listener stopped",
-                            "SoupaWhisper stopped receiving hotkeys and could not restart.\n\n"
-                            f"Executable: {sys.executable}\n\n"
-                            "If this keeps happening on macOS, re-check Accessibility / Input Monitoring permissions.",
-                            logging.ERROR,
-                            10000,
-                            "dialog-error",
-                        )
-
-        try:
-            listener.stop()
-        except Exception:
-            pass
 
     def start_recording(self):
         if self.recording:
@@ -1387,7 +1484,7 @@ class StreamingDictation(Dictation):
             self.notify("Error", "Model is not loaded yet", logging.ERROR, 3000)
             return
         # Capture enforced language once for this streaming session (hotkey press).
-        self._capture_session_enforced_language()
+        self._begin_session_language()
         # Reset transcription state.
         self.recording = True
         self.accumulated_text = ""
@@ -1409,6 +1506,7 @@ class StreamingDictation(Dictation):
         self.audio_stream = self._start_pyaudio_stream(frames_per_buffer)
         if self.audio_stream is None:
             self.recording = False
+            self._end_session_language()
             return
         self.audio_thread = threading.Thread(
             target=self._continuous_audio_stream_worker,
@@ -1708,6 +1806,7 @@ class StreamingDictation(Dictation):
         else:
             logger.info("[idle] No speech detected")
             self.notify("No speech detected", "Try speaking louder or check audio device", logging.WARNING, 2000)
+        self._end_session_language()
 
     def transcribe_file(self, wav_file_path: str) -> str:
         """
@@ -1773,6 +1872,7 @@ class StreamingDictation(Dictation):
         # Stop the keyboard listener to release X11 grabs
         if hasattr(self, '_keyboard_listener') and self._keyboard_listener:
             self._keyboard_listener.stop()
+        self._stop_tray()
 
 
 def check_dependencies(config: dict):

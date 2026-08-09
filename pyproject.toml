@@ -1,7 +1,7 @@
 [project]
 name = "soupawhisper-streaming"
 version = "0.2.0"
-description = "Voice dictation for Linux using faster-whisper"
+description = "Local voice dictation for Linux and macOS — streaming insert, tray status, layout-aware multilingual Whisper"
 authors = [
     {name = "Aleksandr Makarov", email = "4ellendger@gmail.com"}
 ]
@@ -14,6 +14,8 @@ dependencies = [
     "pynput>=1.7.6",
     "webrtcvad>=2.0.10",
     "pyaudio>=0.2.0",
+    "pystray>=0.19.5",
+    "pillow>=12.3.0",
 ]
 optional-dependencies.dev = [
     "pytest>=8.0.0",
@@ -47,4 +49,4 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["dictate"]
+py-modules = ["dictate", "tray_status"]
