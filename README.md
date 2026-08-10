@@ -76,7 +76,7 @@ uv venv --python /usr/bin/python3.12 --system-site-packages && uv sync
 
 Option B (uv/pyenv Python without matching `gi`): build PyGObject into that venv, or use a toolchain that ships GObject packages for that interpreter — there is no pure-PyPI tray path. On GNOME, enable an AppIndicator extension.
 
-**macOS:** clipboard/typing use pbcopy / AppleScript. Grant **Accessibility** to the terminal that runs SoupaWhisper. Background LaunchAgents usually **cannot** receive global hotkeys — run in a **foreground** Terminal for dictation; check with `uv run python dictate.py --test-keys` (`[MATCH]` on your hotkey).
+**macOS:** clipboard uses pbcopy and typing uses Quartz key events, so **Accessibility** is the only permission needed — grant it to whatever runs SoupaWhisper (the terminal, or the interpreter the LaunchAgent starts). The LaunchAgent receives global hotkeys once **Accessibility** is granted to the interpreter it launches (`.venv/bin/python`), which macOS lists simply as "Python"; until then the log warns `This process is not trusted`. Check with `uv run python dictate.py --test-keys` (`[MATCH]` on your hotkey).
 
 **Manual deps only** (no installer): install the packages above, then `poetry install` or `uv sync`, and `cp config.example.ini ~/.config/soupawhisper/config.ini`.
 
@@ -175,8 +175,8 @@ sudo usermod -aG input $USER
 
 **macOS: hotkey (e.g. F10/F12) does nothing**
 
-1. Run in the **foreground** from Terminal (`make run` / `uv run python dictate.py`). The launchd agent usually cannot receive global hotkeys.
-2. **System Settings → Privacy & Security → Accessibility** — add Terminal (or iTerm / the app you use), then restart it.
+1. **System Settings → Privacy & Security → Accessibility** — enable the entry for whatever runs SoupaWhisper: the LaunchAgent's interpreter (listed as "Python"), or Terminal/iTerm for a foreground run. Then restart it — the grant is only read at process start.
+2. Note that macOS keys this permission to the interpreter's path, so rebuilding `.venv` or upgrading Homebrew Python revokes it and you must grant the new binary.
 3. Prefer **Use F1, F2, etc. as standard function keys**, or hold **Fn** so F-keys are not media keys.
 4. Verify with `--test-keys` (below). A “process is not trusted” / monitoring warning means Accessibility is still missing.
 
