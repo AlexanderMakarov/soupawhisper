@@ -249,6 +249,15 @@ For finer analysis, `word_timestamps = true` additionally writes `mic.words.json
 - Set `audio_input_device` in config to the correct index or name.
 - Ensure the microphone works in system settings and is not muted.
 
+Silent input is always logged as `[record] Audio input is effectively silent (too low amplitude)` or `[record] Audio input contains only zeros`. The matching on-screen notification is off by default, because in streaming mode every pause between utterances looks silent and the banner covers the controls you are clicking. To get it back while diagnosing a dead microphone:
+
+```ini
+[behavior]
+notify_no_audio = true
+```
+
+It then shows at most once per dictation session, not once per silent segment.
+
 **Bad transcription / suspect the mic, not the model**
 
 Enable persistent capture, dictate briefly, then listen:
