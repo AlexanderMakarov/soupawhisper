@@ -1170,5 +1170,175 @@ class TestTrayStatus:
         assert tray._language_menu_text() == "Language: AUTO"
 
 
+class TestMacOSMenuBarImage:
+    """macOS draws its own pixmap: pystray squashes any image to the bar thickness."""
+
+    @staticmethod
+    def _mic() -> "Image.Image":
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((22, 6, 42, 40), radius=10, fill=(0, 0, 0, 255))
+        draw.rectangle((30, 40, 34, 56), fill=(0, 0, 0, 255))
+        return img
+
+    @staticmethod
+    def _rows_with_ink(img) -> list[int]:
+        px = img.load()
+        return [
+            y
+            for y in range(img.height)
+            if any(px[x, y][3] > 40 for x in range(img.width))
+        ]
+
+    def test_rendered_at_retina_scale(self):
+        import tray_status
+
+        img = tray_status.macos_menu_bar_image(self._mic(), "AUTO", "idle", thickness=22, scale=2)
+        assert img.height == 44
+
+    def test_glyph_does_not_touch_bar_edges(self):
+        """22pt edge-to-edge is why the icon reads as oversized; leave breathing room."""
+        import tray_status
+
+        img = tray_status.macos_menu_bar_image(self._mic(), "AUTO", "idle", thickness=22, scale=2)
+        rows = self._rows_with_ink(img)
+        assert rows, "image is empty"
+        assert min(rows) >= 2
+        assert max(rows) <= img.height - 3
+
+    def test_badge_sits_below_the_glyph(self):
+        import tray_status
+        from PIL import Image
+
+        # A solid block fills its glyph box exactly, so any ink lower down is the chip.
+        block = Image.new("RGBA", (64, 64), (0, 0, 0, 255))
+        img = tray_status.macos_menu_bar_image(block, "AUTO", "idle", thickness=22, scale=2)
+        pad = round(44 * tray_status.MACOS_EDGE_PADDING_RATIO)
+        glyph_bottom = pad + round(44 * tray_status.MACOS_GLYPH_RATIO) - 1
+        assert max(self._rows_with_ink(img)) > glyph_bottom
+
+    def test_short_labels_stay_centered(self):
+        import tray_status
+
+        auto = tray_status.macos_menu_bar_image(self._mic(), "AUTO", "idle", thickness=22, scale=2)
+        en = tray_status.macos_menu_bar_image(self._mic(), "EN", "idle", thickness=22, scale=2)
+        assert auto.size == en.size
+
+    def test_template_states_render_opaque_mask(self):
+        """setTemplate_ keeps only alpha, so badge text must be ink, not a knocked-out chip."""
+        import tray_status
+
+        img = tray_status.macos_menu_bar_image(self._mic(), "AUTO", "idle", thickness=22, scale=2)
+        badge_band = img.crop((0, img.height // 2, img.width, img.height))
+        assert max(px[3] for px in badge_band.getdata()) > 200
+
+    @pytest.mark.parametrize("thickness,scale", [(22, 2), (24, 2), (37, 2), (22, 1), (22, 3)])
+    def test_layout_scales_with_the_measured_bar(self, thickness, scale):
+        """Bar thickness is not a constant across macOS releases and displays."""
+        import tray_status
+
+        img = tray_status.macos_menu_bar_image(
+            self._mic(), "AUTO", "idle", thickness=thickness, scale=scale
+        )
+        height = round(thickness * scale)
+        assert img.height == height
+
+        rows = self._rows_with_ink(img)
+        pad = max(1, round(height * tray_status.MACOS_EDGE_PADDING_RATIO))
+        assert min(rows) >= pad, "glyph must not touch the top of the bar"
+        assert max(rows) <= height - pad - 1, "chip must not touch the bottom of the bar"
+
+        # The glyph keeps its share of the bar instead of a fixed point size.
+        glyph_px = round(height * tray_status.MACOS_GLYPH_RATIO)
+        assert max(self._rows_with_ink(img)) > pad + glyph_px - 1, "chip sits below the glyph"
+
+    def test_colored_state_badge_uses_the_state_colour(self):
+        """White-on-outline vanishes into a light menu bar; the chip tracks the glyph."""
+        import tray_status
+
+        img = tray_status.macos_menu_bar_image(
+            self._mic(), "AUTO", "recording", thickness=22, scale=2
+        )
+        band = img.crop((0, img.height // 2, img.width, img.height))
+        colours = {px[:3] for px in band.getdata() if px[3] > 200}
+        assert tray_status.MACOS_BADGE_COLORS["recording"][:3] in colours
+
+    def test_macos_install_image_hides_button_title(self):
+        """The language chip lives in the pixmap; no second copy beside the icon."""
+        import tray_status
+
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = SimpleNamespace(config={"tray_show_language": True})
+        tray._images = {name: self._mic() for name in tray_status.STATE_NAMES}
+        button = MagicMock()
+        status_item = MagicMock()
+        status_item.button.return_value = button
+        tray._icon = SimpleNamespace(_status_item=status_item)
+
+        # AppKit only exists on macOS; the test runs everywhere, so stub the bridge.
+        with patch.object(tray_status, "IS_MACOS", True):
+            with patch.object(tray_status, "_ns_image_from", return_value="NSImage") as make:
+                tray._install_macos_image("idle", "AUTO")
+
+        make.assert_called_once()
+        assert make.call_args.kwargs["template"] is True
+        button.setImage_.assert_called_once_with("NSImage")
+        button.setTitle_.assert_called_once_with("")
+
+    def test_macos_colored_states_are_not_template_images(self):
+        """Recording/error carry meaning in their colour; a template mask would erase it."""
+        import tray_status
+
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = SimpleNamespace(config={"tray_show_language": True})
+        tray._images = {name: self._mic() for name in tray_status.STATE_NAMES}
+        status_item = MagicMock()
+        tray._icon = SimpleNamespace(_status_item=status_item)
+
+        with patch.object(tray_status, "IS_MACOS", True):
+            with patch.object(tray_status, "_ns_image_from", return_value="NSImage") as make:
+                tray._install_macos_image("recording", "EN")
+
+        assert make.call_args.kwargs["template"] is False
+
+    def test_apply_language_badge_sets_no_title_on_macos(self):
+        import tray_status
+
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        button = MagicMock()
+        status_item = MagicMock()
+        status_item.button.return_value = button
+        icon = MagicMock()
+        icon._appindicator = None
+        icon._status_item = status_item
+        tray._icon = icon
+
+        with patch.object(tray_status, "IS_MACOS", True):
+            tray._apply_language_badge("AUTO")
+
+        button.setTitle_.assert_not_called()
+
+    def test_setup_installs_macos_image_before_polling(self):
+        """Template mode was only applied on a state change, so the first icon was raw."""
+        import tray_status
+
+        d = SimpleNamespace(running=False)
+        tray = tray_status.TrayStatus.__new__(tray_status.TrayStatus)
+        tray.dictation = d
+        tray._stop_poll = threading.Event()
+        tray._stop_poll.set()
+        tray._last_state = "idle"
+        tray._last_badge = "AUTO"
+        icon = MagicMock()
+
+        with patch.object(tray_status, "IS_MACOS", True):
+            with patch.object(tray, "_install_macos_image") as install:
+                tray._setup(icon)
+
+        install.assert_called_once_with("idle", "AUTO")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
