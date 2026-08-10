@@ -178,32 +178,97 @@ class TestTyper:
     
     def test_typer_init(self, mock_xdotool):
         """Test Typer initialization."""
-        typer = dictate.Typer(delay_ms=20, start_delay_ms=100)
+        with patch.object(dictate, "IS_MACOS", False):
+            typer = dictate.Typer(delay_ms=20, start_delay_ms=100)
         assert typer.delay_ms == 20
         assert typer.start_delay_ms == 100
         assert typer.enabled is True
     
     def test_typer_type_rewrite_append(self, mock_xdotool):
         """Test typing text (append mode with previous_length=0)."""
-        typer = dictate.Typer()
-        typer.type_rewrite("hello world", 0)
+        with patch.object(dictate, "IS_MACOS", False):
+            typer = dictate.Typer()
+            typer.type_rewrite("hello world", 0)
         assert mock_xdotool._mock_run.called
-    
+
     def test_typer_type_rewrite_incremental(self, mock_xdotool):
         """Test incremental typing using type_rewrite with previous_length=0."""
-        typer = dictate.Typer()
-        # Simulate incremental: calculate suffix and type with previous_length=0
-        previous_text = "hello"
-        new_text = "hello world"
-        suffix = new_text[len(previous_text):]
-        typer.type_rewrite(suffix, 0)
+        with patch.object(dictate, "IS_MACOS", False):
+            typer = dictate.Typer()
+            # Simulate incremental: calculate suffix and type with previous_length=0
+            previous_text = "hello"
+            new_text = "hello world"
+            suffix = new_text[len(previous_text):]
+            typer.type_rewrite(suffix, 0)
         assert mock_xdotool._mock_run.called
-    
+
     def test_typer_type_rewrite_correction(self, mock_xdotool):
         """Test rewrite typing with character removal."""
-        typer = dictate.Typer()
-        typer.type_rewrite("new text", 5)
+        with patch.object(dictate, "IS_MACOS", False):
+            typer = dictate.Typer()
+            typer.type_rewrite("new text", 5)
         assert mock_xdotool._mock_run.called
+
+
+class TestTyperMacOS:
+    """macOS types through Quartz (pynput), so no Apple Events consent is involved."""
+
+    @staticmethod
+    def _typer(**kwargs):
+        with patch.object(dictate, "IS_MACOS", True):
+            return dictate.Typer(delay_ms=1, start_delay_ms=0, **kwargs)
+
+    def test_types_via_pynput_without_shelling_out(self):
+        """AppleScript keystroke needs Automation access and stalls on its consent dialog."""
+        typer = self._typer()
+        typer._controller.reset_mock()
+        with patch.object(dictate, "IS_MACOS", True):
+            with patch.object(dictate.subprocess, "run") as run:
+                typer.type_rewrite("привет", 0)
+
+        typed = "".join(call.args[0] for call in typer._controller.type.call_args_list)
+        assert typed == "привет"
+        run.assert_not_called()
+
+    def test_deletes_previous_text_with_backspace(self):
+        typer = self._typer()
+        typer._controller.reset_mock()
+        with patch.object(dictate, "IS_MACOS", True):
+            typer.type_rewrite("new", 3)
+        assert typer._controller.tap.call_count == 3
+
+    def test_zero_delay_types_the_whole_string_in_one_burst(self):
+        """A per-character sleep dominates the cost; 0 means hand it all to pynput at once."""
+        typer = self._typer()
+        typer.delay_ms = 0
+        typer._controller.reset_mock()
+        with patch.object(dictate, "IS_MACOS", True):
+            with patch.object(dictate.time, "sleep") as sleep:
+                typer.type_rewrite("hello world", 0)
+
+        typer._controller.type.assert_called_once_with("hello world")
+        sleep.assert_not_called()
+
+    def test_positive_delay_still_paces_characters(self):
+        """Kept so typing_delay can still be raised to watch the text appear."""
+        typer = self._typer()
+        typer.delay_ms = 5
+        typer._controller.reset_mock()
+        with patch.object(dictate, "IS_MACOS", True):
+            with patch.object(dictate.time, "sleep") as sleep:
+                typer.type_rewrite("abc", 0)
+
+        assert typer._controller.type.call_count == 3
+        assert sleep.call_args_list == [((0.005,),)] * 3
+
+    def test_zero_delay_survives_the_constructor(self):
+        with patch.object(dictate, "IS_MACOS", True):
+            assert dictate.Typer(delay_ms=0).delay_ms == 0
+
+    def test_no_controller_built_on_linux(self, mock_xdotool):
+        with patch.object(dictate, "IS_MACOS", False):
+            typer = dictate.Typer()
+        assert typer._controller is None
 
 
 class TestStreamingDictation:

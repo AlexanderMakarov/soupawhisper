@@ -534,13 +534,18 @@ def keys_match(
 
 
 class Typer:
-    """Types and removes characters in any input field via xdotool (Linux) or AppleScript (macOS)."""
+    """Types and removes characters in any input field via xdotool (Linux) or Quartz (macOS)."""
 
-    def __init__(self, delay_ms: int = 10, start_delay_ms: int = 250, macos_use_clipboard_paste: bool = False):
-        self.delay_ms = max(1, int(delay_ms))
+    def __init__(self, delay_ms: int = 10, start_delay_ms: int = 250):
+        # 0 means "no pacing": type the whole string in one burst.
+        self.delay_ms = max(0, int(delay_ms))
         self.start_delay_ms = int(start_delay_ms)
-        self.macos_use_clipboard_paste = bool(macos_use_clipboard_paste)
+        self._controller = None
         if IS_MACOS:
+            # Quartz key events need only Accessibility, which the hotkey listener already
+            # holds. Driving System Events over AppleScript would additionally require
+            # Automation access, and blocks on its consent dialog until the call times out.
+            self._controller = keyboard.Controller()
             self.enabled = True
         else:
             self.enabled = subprocess.run(["which", "xdotool"], capture_output=True).returncode == 0
@@ -565,46 +570,16 @@ class Typer:
             self._type_linux(text, previous_length)
 
     def _type_macos(self, text: str, previous_length: int = 0):
-        # On macOS, `System Events` keystroke may be layout-dependent for ASCII.
-        # Pasting via clipboard is layout-independent and works for both Latin/Cyrillic.
-        if self.macos_use_clipboard_paste:
-            # Best-effort preserve clipboard contents.
-            prev_clip = _run_cmd(["pbpaste"], timeout_s=0.8) or ""
-            try:
-                if previous_length > 0:
-                    script = (
-                        'tell application "System Events" to key code 51 using {} -- delete\n'
-                        * previous_length
-                    )
-                    subprocess.run(
-                        ["osascript", "-e", script],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=2,
-                    )
-                # Set clipboard to desired text.
-                p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-                p.communicate(input=text.encode())
-                # Paste (Cmd+V).
-                subprocess.run(
-                    ["osascript", "-e", 'tell application "System Events" to keystroke "v" using {command down}'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                )
-            finally:
-                # Restore clipboard.
-                p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-                p.communicate(input=prev_clip.encode())
+        # Quartz carries the characters as a Unicode string, so the active keyboard layout
+        # does not rewrite them — Latin and Cyrillic both arrive as spoken.
+        for _ in range(previous_length):
+            self._controller.tap(keyboard.Key.backspace)
+        if self.delay_ms <= 0:
+            self._controller.type(text)
             return
-
-        # Fallback: type via keystroke (can be layout-dependent).
-        if previous_length > 0:
-            script = f'tell application "System Events" to key code 51 using {{}} -- delete\n' * previous_length
-            subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-        script = f'tell application "System Events" to keystroke "{escaped}"'
-        subprocess.run(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        for char in text:
+            self._controller.type(char)
+            time.sleep(self.delay_ms / 1000.0)
 
     def _type_linux(self, text: str, previous_length: int = 0):
         if previous_length > 0:
@@ -665,7 +640,6 @@ class Dictation:
             self.typer = Typer(
                 delay_ms=int(self.config["typing_delay"] * 1000),
                 start_delay_ms=100,  # Delay to avoid modifiers from hotkey
-                macos_use_clipboard_paste=False,
             )
 
         # Load model in background.
@@ -1406,7 +1380,6 @@ class StreamingDictation(Dictation):
             self.typer = Typer(
                 delay_ms=int(self.config["typing_delay"] * 1000),
                 start_delay_ms=100,
-                macos_use_clipboard_paste=False,
             )
 
         # State variables.
@@ -1522,7 +1495,6 @@ class StreamingDictation(Dictation):
             self.typer = Typer(
                 delay_ms=int(self.config["typing_delay"] * 1000),
                 start_delay_ms=100,
-                macos_use_clipboard_paste=False,
             )
             self.typing_thread = threading.Thread(target=self._typing_worker, daemon=True)
             self.typing_thread.start()
@@ -1878,7 +1850,7 @@ class StreamingDictation(Dictation):
 def check_dependencies(config: dict):
     """Check that required system commands are available."""
     if IS_MACOS:
-        # macOS uses pbcopy and osascript (AppleScript) which are always present.
+        # macOS types through Quartz and copies with pbcopy; neither needs installing.
         return
     missing = []
     required_cmds = []
