@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import platform
 import subprocess
@@ -28,6 +29,27 @@ BADGE_FONT_CANDIDATES = (
 )
 
 IS_MACOS = platform.system() == "Darwin"
+
+# macOS menu bar geometry, in points. pystray scales whatever image it is given to
+# NSStatusBar.thickness() square and hands it to AppKit at 1x, which both fills the bar
+# edge to edge and blurs on Retina. We compose the pixmap ourselves instead: the glyph is
+# inset so it matches Apple's own icons, and the whole thing is drawn at the display scale.
+MACOS_GLYPH_POINTS = 13  # mic height when the language chip is stacked under it
+MACOS_GLYPH_ONLY_POINTS = 16  # mic height when the bar shows the glyph alone
+MACOS_EDGE_PADDING_POINTS = 1
+MACOS_FALLBACK_THICKNESS = 22.0
+MACOS_FALLBACK_SCALE = 2
+# Template images are drawn from alpha alone, so macOS tints them for the current menu bar.
+# Only the monochrome states qualify: recording/transcribing/error carry meaning in colour.
+MACOS_TEMPLATE_STATES = frozenset({"idle", "loading"})
+# Non-template states are composited over whatever the wallpaper puts behind the menu bar,
+# so the chip borrows the glyph's colour: readable on a light and a dark bar alike.
+MACOS_BADGE_RED = (232, 40, 44, 255)
+MACOS_BADGE_COLORS = {
+    "recording": MACOS_BADGE_RED,
+    "error": MACOS_BADGE_RED,
+    "transcribing": (196, 132, 0, 255),
+}
 
 
 class TrayStartError(Exception):
@@ -135,6 +157,97 @@ def compose_language_badge(base: Image.Image, badge: str) -> Image.Image:
     ty = y0 + (chip_h - th) // 2 - text_bbox[1]
     draw.text((tx, ty), badge, fill=(255, 255, 255, 255), font=font)
     return img
+
+
+def fit_badge_font(text: str, max_height: int) -> ImageFont.ImageFont:
+    """Largest candidate font whose text fits the chip band."""
+    size = max(6, max_height)
+    while size > 6:
+        font = load_badge_font(size)
+        bbox = font.getbbox(text)
+        if bbox[3] - bbox[1] <= max_height:
+            return font
+        size -= 1
+    return load_badge_font(6)
+
+
+def macos_menu_bar_image(
+    base: Image.Image,
+    badge: str,
+    state: str,
+    thickness: float = MACOS_FALLBACK_THICKNESS,
+    scale: int = MACOS_FALLBACK_SCALE,
+) -> Image.Image:
+    """Compose the menu bar pixmap: inset glyph, language chip stacked under it.
+
+    Rendered at ``scale`` times the point size so AppKit can draw it crisply on Retina.
+    Every label is laid out on the ``BADGE_WIDTH_GUIDE`` box, so EN/RU/AUTO share one
+    width and the icon never shifts as the session language changes.
+    """
+    height = int(round(thickness * scale))
+    pad = max(1, int(round(MACOS_EDGE_PADDING_POINTS * scale)))
+    if badge:
+        glyph_px = int(round(MACOS_GLYPH_POINTS * scale))
+        badge_px = max(1, height - 2 * pad - glyph_px)
+    else:
+        glyph_px = min(int(round(MACOS_GLYPH_ONLY_POINTS * scale)), height - 2 * pad)
+        badge_px = 0
+
+    glyph = base.convert("RGBA").resize((glyph_px, glyph_px), Image.LANCZOS)
+
+    font = None
+    guide_bbox = (0, 0, 0, 0)
+    if badge_px:
+        font = fit_badge_font(BADGE_WIDTH_GUIDE, badge_px)
+        guide_bbox = font.getbbox(BADGE_WIDTH_GUIDE)
+    width = max(glyph_px, guide_bbox[2] - guide_bbox[0] + 2 * pad)
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    glyph_y = pad if badge_px else (height - glyph_px) // 2
+    img.alpha_composite(glyph, ((width - glyph_px) // 2, glyph_y))
+    if not badge_px or font is None:
+        return img
+
+    draw = ImageDraw.Draw(img)
+    text_bbox = draw.textbbox((0, 0), badge, font=font)
+    tx = (width - (text_bbox[2] - text_bbox[0])) // 2 - text_bbox[0]
+    band_top = glyph_y + glyph_px
+    ty = band_top + (badge_px - (text_bbox[3] - text_bbox[1])) // 2 - text_bbox[1]
+    # Template states keep plain black ink; macOS repaints it in the menu bar's own colour.
+    fill = (0, 0, 0, 255)
+    if state not in MACOS_TEMPLATE_STATES:
+        fill = MACOS_BADGE_COLORS.get(state, (232, 40, 44, 255))
+    draw.text((tx, ty), badge, fill=fill, font=font)
+    return img
+
+
+def _macos_bar_metrics() -> tuple[float, int]:
+    """(menu bar thickness in points, display scale). Falls back to the common 22pt @2x."""
+    try:
+        import AppKit
+
+        thickness = float(AppKit.NSStatusBar.systemStatusBar().thickness())
+        screen = AppKit.NSScreen.mainScreen()
+        scale = int(round(float(screen.backingScaleFactor()))) if screen else MACOS_FALLBACK_SCALE
+        return thickness, max(1, scale)
+    except Exception as e:
+        logger.debug("Could not read menu bar metrics: %s", e)
+        return MACOS_FALLBACK_THICKNESS, MACOS_FALLBACK_SCALE
+
+
+def _ns_image_from(img: Image.Image, *, point_size: tuple[float, float], template: bool):
+    """Wrap a PIL image in an NSImage sized in points, so the extra pixels read as Retina."""
+    import io
+
+    import AppKit
+    import Foundation
+
+    buf = io.BytesIO()
+    img.save(buf, "png")
+    ns_image = AppKit.NSImage.alloc().initWithData_(Foundation.NSData(buf.getvalue()))
+    ns_image.setSize_(AppKit.NSMakeSize(*point_size))
+    ns_image.setTemplate_(template)
+    return ns_image
 
 
 def load_state_images(assets_dir: Path = ASSETS_DIR) -> dict[str, Image.Image]:
@@ -266,6 +379,10 @@ class TrayStatus:
 
     def _setup(self, icon) -> None:
         icon.visible = True
+        # pystray has just installed its own squashed 1x pixmap; replace it before the
+        # first frame the user sees, then keep it in step from _refresh().
+        if IS_MACOS:
+            self._install_macos_image(self._last_state, self._last_badge)
         try:
             while not self._stop_poll.is_set() and getattr(self.dictation, "running", True):
                 self._refresh(icon)
@@ -281,9 +398,11 @@ class TrayStatus:
         title = self._title_for(state)
         badge = self._language_badge_text()
         if state != self._last_state or badge != self._last_badge:
-            icon.icon = self._image_for(state, badge)
-            self._apply_template_if_needed(state)
-            self._apply_language_badge(badge)
+            if IS_MACOS:
+                self._install_macos_image(state, badge)
+            else:
+                icon.icon = self._image_for(state, badge)
+                self._apply_language_badge(badge)
             self._last_state = state
             self._last_badge = badge
         if title != self._last_title:
@@ -311,8 +430,29 @@ class TrayStatus:
         label, _ = language_label(self.dictation)
         return latin1_safe(label)
 
+    def _install_macos_image(self, state: str, badge: str) -> None:
+        """Draw the menu bar pixmap ourselves — see macos_menu_bar_image() for why."""
+        icon = self._icon
+        status_item = getattr(icon, "_status_item", None) if icon is not None else None
+        if status_item is None:
+            return
+        thickness, scale = _macos_bar_metrics()
+        img = macos_menu_bar_image(self._images[state], badge, state, thickness, scale)
+        try:
+            ns_image = _ns_image_from(
+                img,
+                point_size=(img.width / scale, img.height / scale),
+                template=state in MACOS_TEMPLATE_STATES,
+            )
+            button = status_item.button()
+            button.setImage_(ns_image)
+            # The language is baked into the pixmap; a button title would repeat it.
+            button.setTitle_("")
+        except Exception as e:
+            logger.debug("Could not install macOS menu bar image: %s", e)
+
     def _apply_language_badge(self, badge: str) -> None:
-        """Also set AppIndicator/macOS native labels when available (icon pixmap is primary)."""
+        """Also set the AppIndicator label when available (icon pixmap is primary)."""
         icon = self._icon
         if icon is None:
             return
@@ -333,14 +473,6 @@ class TrayStatus:
                 GLib.idle_add(apply)
             except Exception as e:
                 logger.debug("Could not schedule set_label: %s", e)
-            return
-
-        status_item = getattr(icon, "_status_item", None)
-        if status_item is not None and IS_MACOS:
-            try:
-                status_item.button().setTitle_(badge)
-            except Exception as e:
-                logger.debug("macOS setTitle_ failed: %s", e)
 
     def _menu_signature(self) -> tuple:
         """Stable snapshot of dynamic menu fields (avoid needless rebuilds)."""
@@ -352,19 +484,6 @@ class TrayStatus:
             self._toggle_menu_text(),
             self._toggle_enabled(),
         )
-
-    def _apply_template_if_needed(self, state: str) -> None:
-        if not IS_MACOS or self._icon is None:
-            return
-        if state not in {"idle", "loading"}:
-            return
-        ns_image = getattr(self._icon, "_icon_image", None)
-        if ns_image is None:
-            return
-        try:
-            ns_image.setTemplate_(True)
-        except Exception as e:
-            logger.debug("Could not mark tray image as template: %s", e)
 
     def _title_for(self, state: str) -> str:
         tip = tooltip_for(self.dictation, state)
