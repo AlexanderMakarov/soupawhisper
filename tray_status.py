@@ -30,13 +30,19 @@ BADGE_FONT_CANDIDATES = (
 
 IS_MACOS = platform.system() == "Darwin"
 
-# macOS menu bar geometry, in points. pystray scales whatever image it is given to
+# macOS menu bar geometry. pystray scales whatever image it is given to
 # NSStatusBar.thickness() square and hands it to AppKit at 1x, which both fills the bar
 # edge to edge and blurs on Retina. We compose the pixmap ourselves instead: the glyph is
 # inset so it matches Apple's own icons, and the whole thing is drawn at the display scale.
-MACOS_GLYPH_POINTS = 13  # mic height when the language chip is stacked under it
-MACOS_GLYPH_ONLY_POINTS = 16  # mic height when the bar shows the glyph alone
-MACOS_EDGE_PADDING_POINTS = 1
+#
+# Everything below is a fraction of the measured bar thickness rather than a point size,
+# because that thickness is not a constant: it has changed across macOS releases and can
+# differ per display. Ratios keep the same proportions on whatever bar we are handed.
+MACOS_GLYPH_RATIO = 13 / 22  # mic height when the language chip is stacked under it
+MACOS_GLYPH_ONLY_RATIO = 16 / 22  # mic height when the bar shows the glyph alone
+MACOS_EDGE_PADDING_RATIO = 1 / 22
+MACOS_MIN_BADGE_FONT_PX = 6
+# Used only when AppKit cannot be queried; 22pt @2x is the common case.
 MACOS_FALLBACK_THICKNESS = 22.0
 MACOS_FALLBACK_SCALE = 2
 # Template images are drawn from alpha alone, so macOS tints them for the current menu bar.
@@ -161,14 +167,14 @@ def compose_language_badge(base: Image.Image, badge: str) -> Image.Image:
 
 def fit_badge_font(text: str, max_height: int) -> ImageFont.ImageFont:
     """Largest candidate font whose text fits the chip band."""
-    size = max(6, max_height)
-    while size > 6:
+    size = max(MACOS_MIN_BADGE_FONT_PX, max_height)
+    while size > MACOS_MIN_BADGE_FONT_PX:
         font = load_badge_font(size)
         bbox = font.getbbox(text)
         if bbox[3] - bbox[1] <= max_height:
             return font
         size -= 1
-    return load_badge_font(6)
+    return load_badge_font(MACOS_MIN_BADGE_FONT_PX)
 
 
 def macos_menu_bar_image(
@@ -185,12 +191,12 @@ def macos_menu_bar_image(
     width and the icon never shifts as the session language changes.
     """
     height = int(round(thickness * scale))
-    pad = max(1, int(round(MACOS_EDGE_PADDING_POINTS * scale)))
+    pad = max(1, int(round(height * MACOS_EDGE_PADDING_RATIO)))
     if badge:
-        glyph_px = int(round(MACOS_GLYPH_POINTS * scale))
+        glyph_px = int(round(height * MACOS_GLYPH_RATIO))
         badge_px = max(1, height - 2 * pad - glyph_px)
     else:
-        glyph_px = min(int(round(MACOS_GLYPH_ONLY_POINTS * scale)), height - 2 * pad)
+        glyph_px = min(int(round(height * MACOS_GLYPH_ONLY_RATIO)), height - 2 * pad)
         badge_px = 0
 
     glyph = base.convert("RGBA").resize((glyph_px, glyph_px), Image.LANCZOS)

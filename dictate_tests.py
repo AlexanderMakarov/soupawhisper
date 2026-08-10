@@ -1150,8 +1150,8 @@ class TestMacOSMenuBarImage:
         # A solid block fills its glyph box exactly, so any ink lower down is the chip.
         block = Image.new("RGBA", (64, 64), (0, 0, 0, 255))
         img = tray_status.macos_menu_bar_image(block, "AUTO", "idle", thickness=22, scale=2)
-        pad = round(tray_status.MACOS_EDGE_PADDING_POINTS * 2)
-        glyph_bottom = pad + round(tray_status.MACOS_GLYPH_POINTS * 2) - 1
+        pad = round(44 * tray_status.MACOS_EDGE_PADDING_RATIO)
+        glyph_bottom = pad + round(44 * tray_status.MACOS_GLYPH_RATIO) - 1
         assert max(self._rows_with_ink(img)) > glyph_bottom
 
     def test_short_labels_stay_centered(self):
@@ -1168,6 +1168,26 @@ class TestMacOSMenuBarImage:
         img = tray_status.macos_menu_bar_image(self._mic(), "AUTO", "idle", thickness=22, scale=2)
         badge_band = img.crop((0, img.height // 2, img.width, img.height))
         assert max(px[3] for px in badge_band.getdata()) > 200
+
+    @pytest.mark.parametrize("thickness,scale", [(22, 2), (24, 2), (37, 2), (22, 1), (22, 3)])
+    def test_layout_scales_with_the_measured_bar(self, thickness, scale):
+        """Bar thickness is not a constant across macOS releases and displays."""
+        import tray_status
+
+        img = tray_status.macos_menu_bar_image(
+            self._mic(), "AUTO", "idle", thickness=thickness, scale=scale
+        )
+        height = round(thickness * scale)
+        assert img.height == height
+
+        rows = self._rows_with_ink(img)
+        pad = max(1, round(height * tray_status.MACOS_EDGE_PADDING_RATIO))
+        assert min(rows) >= pad, "glyph must not touch the top of the bar"
+        assert max(rows) <= height - pad - 1, "chip must not touch the bottom of the bar"
+
+        # The glyph keeps its share of the bar instead of a fixed point size.
+        glyph_px = round(height * tray_status.MACOS_GLYPH_RATIO)
+        assert max(self._rows_with_ink(img)) > pad + glyph_px - 1, "chip sits below the glyph"
 
     def test_colored_state_badge_uses_the_state_colour(self):
         """White-on-outline vanishes into a light menu bar; the chip tracks the glyph."""
