@@ -310,12 +310,12 @@ def conversation_metrics(blocks: list[Block]) -> dict:
         )
 
     them = stats["them_speaking_s"]
-    stats["speaking_ratio"] = round(stats["me_speaking_s"] / them, 2) if them else None
+    stats["me_them_speaking_ratio"] = round(stats["me_speaking_s"] / them, 2) if them else None
     return stats
 
 
 _FRONTMATTER_ORDER = (
-    "speaking_ratio", "me_speaking_s", "them_speaking_s",
+    "me_them_speaking_ratio", "me_speaking_s", "them_speaking_s",
     "me_wpm_avg", "me_wpm_stdev", "them_wpm_avg", "them_wpm_stdev",
     "me_think_time_avg_s", "me_think_time_stdev_s",
     "them_think_time_avg_s", "them_think_time_stdev_s",

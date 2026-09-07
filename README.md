@@ -216,7 +216,7 @@ Every transcript opens with YAML frontmatter summarising the conversation:
 
 ```yaml
 ---
-speaking_ratio: 5.36        # your speaking time / theirs
+me_them_speaking_ratio: 5.36        # your speaking time / theirs
 me_speaking_s: 111.4
 them_speaking_s: 20.8
 me_wpm_avg: 147.6           # words per minute, averaged over your turns

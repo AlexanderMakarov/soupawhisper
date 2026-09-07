@@ -1060,12 +1060,12 @@ class TestConversationMetrics:
 
         assert m["me_speaking_s"] == 30.0
         assert m["them_speaking_s"] == 10.0
-        assert m["speaking_ratio"] == 3.0
+        assert m["me_them_speaking_ratio"] == 3.0
 
     def test_ratio_is_none_when_only_one_side_spoke(self):
         m = meeting.conversation_metrics([block("Me", 0.0, 10.0, "a")])
 
-        assert m["speaking_ratio"] is None
+        assert m["me_them_speaking_ratio"] is None
         assert m["them_speaking_s"] == 0.0
 
     def test_wpm_is_words_over_block_duration(self):
@@ -1105,7 +1105,7 @@ class TestConversationMetrics:
     def test_empty_transcript_yields_no_crash(self):
         m = meeting.conversation_metrics([])
 
-        assert m["speaking_ratio"] is None
+        assert m["me_them_speaking_ratio"] is None
         assert m["me_wpm_avg"] is None
         assert m["me_think_time_avg_s"] is None
 
@@ -1120,7 +1120,7 @@ class TestFrontmatter:
 
         assert out.startswith("---\n")
         head = out.split("---")[1]
-        assert "speaking_ratio: 3.0" in head
+        assert "me_them_speaking_ratio: 3.0" in head
         assert "me_wpm_avg: 20.0" in head
         assert "# Meeting x" in out
 
@@ -1129,7 +1129,7 @@ class TestFrontmatter:
                                       metrics=meeting.conversation_metrics(
                                           [block("Me", 0.0, 10.0, "hi")]))
 
-        assert "speaking_ratio:\n" in out
+        assert "me_them_speaking_ratio:\n" in out
 
     def test_no_frontmatter_without_metrics(self):
         out = meeting.render_markdown([block("Me", 0.0, 10.0, "hi")], "# x")
