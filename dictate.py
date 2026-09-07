@@ -2,6 +2,8 @@
 
 import argparse
 import configparser
+import ctypes
+import ctypes.util
 import subprocess
 import tempfile
 import threading
@@ -22,6 +24,8 @@ from faster_whisper.transcribe import Segment
 import numpy as np
 import pyaudio
 import webrtcvad
+
+import meeting as meeting_mod
 
 from pynput import keyboard
 from faster_whisper import WhisperModel
@@ -296,57 +300,75 @@ def parse_setxkbmap_layouts(query_text: Optional[str]) -> Optional[list[str]]:
     return None
 
 
-def _linux_xkb_group_index() -> Optional[int]:
-    """Current XKB group index via libX11 XkbGetState (no extra packages)."""
+class _XkbStateRec(ctypes.Structure):
+    _fields_ = [
+        ("group", ctypes.c_ubyte),
+        ("locked_group", ctypes.c_ubyte),
+        ("base_group", ctypes.c_ushort),
+        ("latched_group", ctypes.c_ushort),
+        ("mods", ctypes.c_ubyte),
+        ("base_mods", ctypes.c_ubyte),
+        ("latched_mods", ctypes.c_ubyte),
+        ("locked_mods", ctypes.c_ubyte),
+        ("compat_state", ctypes.c_ubyte),
+        ("grab_mods", ctypes.c_ubyte),
+        ("compat_grab_mods", ctypes.c_ubyte),
+        ("lookup_mods", ctypes.c_ubyte),
+        ("compat_lookup_mods", ctypes.c_ubyte),
+        ("ptr_buttons", ctypes.c_ushort),
+    ]
+
+
+# Opening an X11 display costs ~3.4ms. That runs inside the pynput callback on every
+# trigger-key press, and it is also a race: the modifier can be released before the
+# query lands. Keep one connection open instead -- the query then takes microseconds.
+_x11_lock = threading.Lock()
+_x11_conn: Optional[tuple] = None
+
+
+def _x11_connection() -> Optional[tuple]:
+    global _x11_conn
+    if _x11_conn is not None:
+        return _x11_conn
+    lib_name = ctypes.util.find_library("X11")
+    if not lib_name:
+        return None
+    x11 = ctypes.CDLL(lib_name)
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XkbGetState.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(_XkbStateRec)]
+    x11.XkbGetState.restype = ctypes.c_int
+    dpy = x11.XOpenDisplay(None)
+    if not dpy:
+        return None
+    _x11_conn = (x11, dpy)
+    return _x11_conn
+
+
+def _xkb_state() -> Optional["_XkbStateRec"]:
+    """Current XKB state via libX11 XkbGetState (no extra packages), or None."""
+    global _x11_conn
     try:
-        import ctypes
-        import ctypes.util
-
-        lib_name = ctypes.util.find_library("X11")
-        if not lib_name:
-            return None
-        x11 = ctypes.CDLL(lib_name)
-        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-        x11.XOpenDisplay.restype = ctypes.c_void_p
-        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-        x11.XCloseDisplay.restype = ctypes.c_int
-
-        class XkbStateRec(ctypes.Structure):
-            _fields_ = [
-                ("group", ctypes.c_ubyte),
-                ("locked_group", ctypes.c_ubyte),
-                ("base_group", ctypes.c_ushort),
-                ("latched_group", ctypes.c_ushort),
-                ("mods", ctypes.c_ubyte),
-                ("base_mods", ctypes.c_ubyte),
-                ("latched_mods", ctypes.c_ubyte),
-                ("locked_mods", ctypes.c_ubyte),
-                ("compat_state", ctypes.c_ubyte),
-                ("grab_mods", ctypes.c_ubyte),
-                ("compat_grab_mods", ctypes.c_ubyte),
-                ("lookup_mods", ctypes.c_ubyte),
-                ("compat_lookup_mods", ctypes.c_ubyte),
-                ("ptr_buttons", ctypes.c_ushort),
-            ]
-
-        x11.XkbGetState.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(XkbStateRec)]
-        x11.XkbGetState.restype = ctypes.c_int
-
-        dpy = x11.XOpenDisplay(None)
-        if not dpy:
-            return None
-        try:
-            state = XkbStateRec()
-            # XkbUseCoreKbd; Status Success == 0
-            status = x11.XkbGetState(dpy, 0x0100, ctypes.byref(state))
-            if status != 0:
+        with _x11_lock:
+            conn = _x11_connection()
+            if conn is None:
                 return None
-            return int(state.group)
-        finally:
-            x11.XCloseDisplay(dpy)
+            x11, dpy = conn
+            state = _XkbStateRec()
+            # XkbUseCoreKbd; Status Success == 0
+            if x11.XkbGetState(dpy, 0x0100, ctypes.byref(state)) != 0:
+                return None
+            return state
     except Exception as e:
         logger.debug("XkbGetState failed: %s", e)
+        _x11_conn = None  # force a reconnect next time (e.g. X restarted)
         return None
+
+
+def _linux_xkb_group_index() -> Optional[int]:
+    """Current XKB group index, used to resolve the active keyboard layout."""
+    state = _xkb_state()
+    return None if state is None else int(state.group)
 
 
 def _which_ok(name: str) -> bool:
@@ -485,7 +507,130 @@ def load_config():
         "vad_chunk_size_ms": config.getfloat("streaming", "vad_chunk_size_ms", fallback=20.0),
         "vad_min_speech_chunks": config.getint("streaming", "vad_min_speech_chunks", fallback=10),
         "vad_threshold": config.getfloat("streaming", "vad_threshold", fallback=0.5),
+        # Meeting recording mode. Transcripts are kept; the WAVs they came from are
+        # scratch and live under meeting.TMP_ROOT until transcription succeeds.
+        "meeting_transcript_dir": os.path.expanduser(
+            config.get("meeting", "transcript_dir", fallback="~/Documents/meetings")
+        ),
+        "meeting_max_duration_min": config.getint("meeting", "max_duration_min", fallback=120),
+        # 0 disables the silence watchdog. Generous by default: a false stop loses
+        # the rest of the meeting, over-recording only costs disk.
+        "meeting_silence_stop_min": config.getint("meeting", "silence_stop_min", fallback=10),
+        # Empty = tray only. Meeting mode disables the dictation hotkey while it runs,
+        # so transcribed text can never be typed into the call.
+        "meeting_hotkey": config.get("meeting", "hotkey", fallback="").strip().lower(),
+        # Keep the WAVs after a successful transcript. Off by default (~230 MB/hour),
+        # but the only way to re-run a bad transcript with different settings.
+        "meeting_keep_audio": config.getboolean("meeting", "keep_audio", fallback=False),
+        # Threads for the meeting model. Half the logical cores by default: measured
+        # on an i5-10300H (4 physical + HT), 4 threads was BOTH the fastest setting
+        # (2.5x over 1) and 8 was slower than 1 through oversubscription -- so this
+        # leaves CPU for dictation at no speed cost.
+        "meeting_cpu_threads": config.getint(
+            "meeting", "cpu_threads", fallback=max(1, (os.cpu_count() or 2) // 2)
+        ),
+        # Speech-run segmentation. Fallbacks come from meeting.py so the defaults are
+        # defined once; meeting.RunSettings.from_config() turns these back into the
+        # VadOptions the transcription pass uses.
+        "meeting_run_min_silence_ms": config.getint(
+            "meeting", "run_min_silence_ms", fallback=meeting_mod.RUN_MIN_SILENCE_MS
+        ),
+        "meeting_run_pad_ms": config.getint(
+            "meeting", "run_pad_ms", fallback=meeting_mod.RUN_PAD_MS
+        ),
+        "meeting_run_vad_threshold": config.getfloat(
+            "meeting", "run_vad_threshold", fallback=meeting_mod.RUN_VAD_THRESHOLD
+        ),
+        "meeting_run_min_speech_ms": config.getint(
+            "meeting", "run_min_speech_ms", fallback=meeting_mod.RUN_MIN_SPEECH_MS
+        ),
+        "meeting_run_max_seconds": config.getfloat(
+            "meeting", "run_max_seconds", fallback=meeting_mod.LANGUAGE_WINDOW_S
+        ),
+        "meeting_min_avg_logprob": config.getfloat(
+            "meeting", "min_avg_logprob", fallback=meeting_mod.MIN_AVG_LOGPROB
+        ),
+        # Glossary priming for meeting transcription. Defaults to the dictation
+        # glossary; override when interview/meeting vocabulary differs from the terms
+        # dictated day to day. Measured on a real interview: without it Whisper wrote
+        # "sync 8 group" and "cup flow, air flow" for sync.WaitGroup and Kubeflow.
+        "meeting_custom_terms": config.get(
+            "meeting", "custom_terms",
+            fallback=config.get("behavior", "custom_terms", fallback=""),
+        ).strip(),
+        # How long a single speaker block may run before it is split with a fresh
+        # timestamp. Your own track defaults to 60s: measured against a professional
+        # transcript of the same 73-minute interview, that reproduces its shape
+        # (86 blocks, 110-word longest vs 88 and 121); the previous 600s gave
+        # 415-word walls.
+        "meeting_me_max_block_seconds": config.getfloat(
+            "meeting", "me_max_block_seconds", fallback=meeting_mod.ME_MAX_BLOCK_S
+        ),
+        "meeting_them_max_block_seconds": config.getfloat(
+            "meeting", "them_max_block_seconds", fallback=meeting_mod.THEM_MAX_BLOCK_S
+        ),
     }
+
+
+def scratch_wav_path(filename: str, root: Path = None) -> Path:
+    """Path for a debug/mirror WAV under the shared scratch root.
+
+    Everything this app writes lives under one directory so the tray can report its
+    size and wipe it in one action, and so we never scatter files among other apps'
+    entries in /tmp.
+    """
+    base = Path(root if root is not None else meeting_mod.TMP_ROOT) / "recordings"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / filename
+
+
+# How often the meeting watchdog re-checks duration, silence and recorder health.
+MEETING_WATCHDOG_POLL_S = 30.0
+
+MODIFIER_NAMES = frozenset({"shift", "ctrl", "alt", "cmd"})
+
+
+# X11 modifier mask bits (X.h): ShiftMask, ControlMask, Mod1Mask (Alt), Mod4Mask (Super).
+X11_MODIFIER_MASKS = (("shift", 1), ("ctrl", 4), ("alt", 8), ("cmd", 64))
+
+
+def active_modifiers_x11() -> Optional[set[str]]:
+    """Modifiers physically held right now, read from X11, or None if unavailable.
+
+    Tracking press/release events cannot be trusted here: when layout switching is
+    bound to Shift, X11 reports Shift's RELEASE as an ISO group-switch keysym (65032)
+    rather than Shift, so a tracked set never clears and every later hotkey test is
+    wrong. XkbGetState reports the true current mask and is self-healing.
+    """
+    state = _xkb_state()
+    if state is None:
+        return None
+    return {name for name, mask in X11_MODIFIER_MASKS if state.mods & mask}
+
+
+def modifier_name(key) -> Optional[str]:
+    """Normalise a pynput modifier key to "shift"/"ctrl"/"alt"/"cmd", else None.
+
+    pynput reports sided variants (shift_l, ctrl_r, alt_gr); a hotkey spec should not
+    have to care which physical key was used.
+    """
+    name = getattr(key, "name", None)
+    if not isinstance(name, str):
+        return None
+    base = name.split("_")[0]
+    return base if base in MODIFIER_NAMES else None
+
+
+def parse_hotkey_spec(spec: str) -> tuple[frozenset[str], str]:
+    """Split "shift+f12" into ({"shift"}, "f12").
+
+    Dictation's hotkey is a single key, but meeting mode wants a deliberate combo
+    so it cannot be triggered by accident mid-call.
+    """
+    parts = [p.strip().lower() for p in (spec or "").split("+") if p.strip()]
+    modifiers = frozenset(p for p in parts if p in MODIFIER_NAMES)
+    key = next((p for p in parts if p not in MODIFIER_NAMES), "")
+    return modifiers, key
 
 
 def get_hotkey(key_name: str) -> keyboard.KeyCode:
@@ -632,6 +777,22 @@ class Dictation:
         self._hotkey_vk = getattr(hv, "vk", None) if hv is not None else getattr(self.hotkey, "vk", None)
         self.recording = False
         self.transcribing = False
+        # Meeting recording is a separate, mutually exclusive mode: while it runs the
+        # dictation hotkey is inert, so nothing can be typed into the call.
+        self.meeting_active = False
+        self.meeting: Optional[meeting_mod.MeetingRecorder] = None
+        self._meeting_tmp_root = meeting_mod.TMP_ROOT
+        self._meeting_spawn = subprocess.Popen
+        self._meeting_watchdog: Optional[threading.Thread] = None
+        self._meeting_stop_event = threading.Event()
+        meeting_mods, meeting_key_name = parse_hotkey_spec(config.get("meeting_hotkey", ""))
+        self._meeting_modifiers = meeting_mods
+        self._meeting_key = get_hotkey(meeting_key_name) if meeting_key_name else None
+        self._held_modifiers: set[str] = set()
+        self._modifier_source = active_modifiers_x11
+        self._meeting_model = None
+        self.meeting_transcribing = False
+        self.meeting_progress: Optional[str] = None
         self.model = None
         self.model_loaded = threading.Event()
         self.model_error = None
@@ -658,6 +819,11 @@ class Dictation:
 
         custom_terms = _parse_custom_terms(self.config.get("custom_terms") or "")
         self._custom_terms_kwargs = _build_custom_terms_kwargs(custom_terms)
+        # Meeting mode primes the same way but from its own key, so the two glossaries
+        # can diverge. meeting.finish_session() reads this attribute.
+        self.meeting_terms_kwargs = _build_custom_terms_kwargs(
+            _parse_custom_terms(self.config.get("meeting_custom_terms") or "")
+        )
         if custom_terms:
             logger.info(f"Custom terms glossary active ({len(custom_terms)} term(s)): {custom_terms}")
 
@@ -1005,8 +1171,169 @@ class Dictation:
         text = self._segments_to_text(segments, self.config["auto_sentence"])
         return text, info.duration
 
+    def meeting_model(self):
+        """Whisper model used for meeting transcription, built on first use.
+
+        Deliberately separate from the dictation model: one CTranslate2 model
+        serialises concurrent calls, so sharing it would make dictation wait behind a
+        long meeting transcription. This one is also capped to fewer threads.
+        """
+        if self._meeting_model is None:
+            threads = self.config["meeting_cpu_threads"]
+            logger.info("[meeting] Loading model %s (%d threads)", self.config["model"], threads)
+            self._meeting_model = WhisperModel(
+                self.config["model"],
+                device=self.config["device"],
+                compute_type=self.config["compute_type"],
+                cpu_threads=threads,
+            )
+        return self._meeting_model
+
+    def start_meeting(self) -> None:
+        """Enter meeting mode: capture both tracks and suspend dictation.
+
+        Nothing is transcribed while recording -- two pw-record subprocesses write
+        WAV straight to disk, so the video call keeps the CPU.
+        """
+        if self.meeting_active:
+            logger.info("[meeting] Already recording")
+            return
+        self.meeting = meeting_mod.MeetingRecorder(
+            transcript_dir=Path(self.config["meeting_transcript_dir"]),
+            tmp_root=self._meeting_tmp_root,
+            max_duration_s=self.config["meeting_max_duration_min"] * 60,
+            silence_stop_s=self.config["meeting_silence_stop_min"] * 60,
+            spawn=self._meeting_spawn,
+        )
+        try:
+            self.meeting.start()
+        except OSError as e:
+            self.meeting = None
+            self._tray_error = f"Meeting recording failed: {e}"
+            self.notify("Meeting", f"Could not start recording: {e}", logging.ERROR, 5000)
+            return
+        self.meeting_active = True
+        logger.info("[meeting] Recording to %s", self.meeting.session_dir)
+        self.notify("Meeting", "Recording started (dictation paused)", logging.INFO, 2500)
+        self._meeting_stop_event.clear()
+        self._meeting_watchdog = threading.Thread(
+            target=self._meeting_watchdog_loop, daemon=True
+        )
+        self._meeting_watchdog.start()
+
+    def stop_meeting(self, transcribe: bool = True) -> None:
+        """Leave meeting mode, then transcribe off the hotkey thread."""
+        if not self.meeting_active or self.meeting is None:
+            return
+        session_dir = self.meeting.session_dir
+        self._meeting_stop_event.set()
+        self.meeting.stop_recording()
+        self.meeting_active = False
+        logger.info("[meeting] Recording stopped")
+        if not transcribe:
+            return
+        threading.Thread(
+            target=self._transcribe_meeting, args=(session_dir,), daemon=True
+        ).start()
+
+    def _meeting_watchdog_loop(self) -> None:
+        """Stop the meeting on its own for a dead recorder, the cap, or silence.
+
+        A dead pw-record is nearly always a full disk and is otherwise silent -- the
+        file simply stops growing -- so it must surface rather than leave us
+        "recording" into nothing.
+        """
+        while not self._meeting_stop_event.wait(MEETING_WATCHDOG_POLL_S):
+            if not self.meeting_active or self.meeting is None:
+                return
+            try:
+                failure = self.meeting.track_failure()
+                if failure:
+                    logger.error("[meeting] %s", failure)
+                    self._tray_error = failure
+                    self.notify("Meeting", failure, logging.ERROR, 8000)
+                    self.stop_meeting()
+                    return
+                reason = self.meeting.auto_stop_reason()
+                if reason:
+                    logger.info("[meeting] Auto-stopping (%s)", reason)
+                    message = {
+                        "max_duration": "Recording hit the time limit; transcribing.",
+                        "silence": "No audio for a while; transcribing.",
+                    }[reason]
+                    self.notify("Meeting", message, logging.INFO, 5000)
+                    self.stop_meeting()
+                    return
+            except Exception as e:
+                logger.error("[meeting] Watchdog error: %s", e, exc_info=True)
+
+    def toggle_meeting(self) -> None:
+        self.stop_meeting() if self.meeting_active else self.start_meeting()
+
+    def _transcribe_meeting(self, session_dir) -> None:
+        self.meeting_transcribing = True
+        try:
+            out = meeting_mod.finish_session(
+                self, session_dir, Path(self.config["meeting_transcript_dir"])
+            )
+            self.notify("Meeting", f"Transcript: {out.name}", logging.INFO, 5000)
+        except Exception as e:
+            # The WAVs are deliberately left in place so the meeting is recoverable.
+            logger.error("[meeting] Transcription failed: %s", e, exc_info=True)
+            self._tray_error = f"Meeting transcription failed: {e}"
+            self.notify(
+                "Meeting",
+                f"Transcription failed; audio kept in {session_dir}",
+                logging.ERROR,
+                8000,
+            )
+        finally:
+            self.transcribing = False
+
+    def _handle_modifier(self, key, pressed: bool) -> bool:
+        """Track held modifiers. Returns True if the key was a modifier."""
+        mod = modifier_name(key)
+        if mod is None:
+            return False
+        self._held_modifiers.add(mod) if pressed else self._held_modifiers.discard(mod)
+        return True
+
+    def active_modifiers(self) -> set[str]:
+        """Modifiers held now. Live from X11 where possible, tracked state otherwise."""
+        live = self._modifier_source()
+        return live if live is not None else set(self._held_modifiers)
+
+    def _meeting_hotkey_pressed(self, key) -> bool:
+        """True when the configured meeting combo is exactly satisfied.
+
+        Checked before the dictation gate so the combo can also STOP a meeting --
+        the gate that silences dictation must not silence its own off switch.
+
+        The key is matched first so the (cheap) common case short-circuits before we
+        ask X11 for the modifier state, which happens once per trigger-key press.
+        """
+        if self._meeting_key is None:
+            return False
+        if not keys_match(key, self._meeting_key):
+            return False
+        return self.active_modifiers() == set(self._meeting_modifiers)
+
+    def _dictation_suspended(self) -> bool:
+        """True while meeting mode owns the app and dictation must not fire."""
+        if self.meeting_active:
+            logger.debug("[hotkey] Ignored: meeting recording in progress")
+            return True
+        return False
+
     def on_press(self, key):
         try:
+            if self._handle_modifier(key, pressed=True):
+                return
+            if self._meeting_hotkey_pressed(key):
+                self._schedule_hotkey_action(self.toggle_meeting, "toggle_meeting")
+                return
+            if self._dictation_suspended():
+                return
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
                 self._last_hotkey_event_monotonic = time.monotonic()
                 self._schedule_hotkey_action(self.start_recording, "start_recording")
@@ -1016,6 +1343,12 @@ class Dictation:
 
     def on_release(self, key):
         try:
+            if self._handle_modifier(key, pressed=False):
+                return
+            if self._meeting_hotkey_pressed(key):
+                return  # the press already toggled; do not also stop dictation
+            if self._dictation_suspended():
+                return
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
                 self._last_hotkey_event_monotonic = time.monotonic()
                 self._schedule_hotkey_action(self.stop_recording, "stop_recording")
@@ -1258,7 +1591,7 @@ class Dictation:
                 return
             if self.config.get("save_recordings", False):
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                file_path = os.path.join(tempfile.gettempdir(), f"recording_{timestamp}.wav")
+                file_path = str(scratch_wav_path(f"recording_{timestamp}.wav"))
                 try:
                     with wave.open(file_path, "wb") as wf:
                         wf.setnchannels(1)
@@ -1447,9 +1780,19 @@ class StreamingDictation(Dictation):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
     def _create_hotkey_listener(self) -> keyboard.Listener:
-        listener = keyboard.Listener(on_press=self.on_press)
+        listener = keyboard.Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+        )
         listener.daemon = True
         return listener
+
+    def on_release(self, key):
+        """Streaming toggles on press only; releases just keep modifier state fresh."""
+        try:
+            self._handle_modifier(key, pressed=False)
+        except Exception as e:
+            logger.error("[hotkey] on_release failed: %s", e, exc_info=True)
 
     def _startup_notification(self) -> None:
         if self.config.get("notifications"):
@@ -1463,6 +1806,13 @@ class StreamingDictation(Dictation):
 
     def on_press(self, key):
         try:
+            if self._handle_modifier(key, pressed=True):
+                return
+            if self._meeting_hotkey_pressed(key):
+                self._schedule_hotkey_action(self.toggle_meeting, "toggle_meeting")
+                return
+            if self._dictation_suspended():
+                return
             if keys_match(key, self.hotkey, self._hotkey_value, self._hotkey_vk):
                 self._last_hotkey_event_monotonic = time.monotonic()
                 if not self.recording:
@@ -1740,7 +2090,7 @@ class StreamingDictation(Dictation):
                     break
                 segment, sample_rate = task
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
-                file_path = os.path.join(tempfile.gettempdir(), f"stream_chunk_{timestamp}.wav")
+                file_path = str(scratch_wav_path(f"stream_chunk_{timestamp}.wav"))
                 try:
                     with wave.open(file_path, "wb") as wf:
                         wf.setnchannels(1)

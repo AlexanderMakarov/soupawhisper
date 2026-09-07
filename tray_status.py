@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "tray"
 POLL_INTERVAL_S = 0.2  # Icon / tooltip / menu label refresh only; actions are immediate
-STATE_NAMES = ("idle", "loading", "recording", "transcribing", "error")
+STATE_NAMES = ("idle", "loading", "recording", "transcribing", "error", "meeting")
 # Widen every chip to this label so EN/RU center like AUTO.
 BADGE_WIDTH_GUIDE = "AUTO"
 BADGE_FONT_CANDIDATES = (
@@ -37,12 +37,18 @@ class TrayStartError(Exception):
 def derive_state(dictation: Any) -> str:
     """Map dictation flags to a tray state name.
 
-    Priority: error > loading > recording > transcribing > idle
+    Priority: error > loading > meeting > recording > transcribing > idle
+
+    Meeting outranks recording: while a meeting is being captured the dictation
+    hotkey is disabled, so "recording" would be misleading, and the meeting icon
+    must stay visible for the whole call as the live-capture indicator.
     """
     if getattr(dictation, "model_error", None) or getattr(dictation, "_tray_error", None):
         return "error"
     if not getattr(dictation, "model_loaded", None) or not dictation.model_loaded.is_set():
         return "loading"
+    if getattr(dictation, "meeting_active", False):
+        return "meeting"
     if getattr(dictation, "recording", False):
         return "recording"
     if getattr(dictation, "stopping", False) or getattr(dictation, "transcribing", False):
@@ -223,6 +229,15 @@ class TrayStatus:
                 self._on_toggle_dictation,
                 enabled=self._toggle_enabled,
             ),
+            MenuItem(
+                self._meeting_menu_text,
+                self._on_toggle_meeting,
+                enabled=self._meeting_enabled,
+            ),
+            MenuItem(lambda item: self._meeting_disk_text(), None, enabled=False),
+            MenuItem("Delete recorded audio files", self._on_purge_meeting_audio),
+            MenuItem("Open recorded audio folder", self._on_open_meeting_audio),
+            Menu.SEPARATOR,
             MenuItem("Restart hotkey listener", self._on_restart_listener),
             MenuItem("Open log", self._on_open_log),
             MenuItem("Open config", self._on_open_config),
@@ -429,6 +444,59 @@ class TrayStatus:
             self._refresh(icon)
         except Exception:
             pass
+
+    def _meeting_tmp_root(self) -> Path:
+        import meeting
+
+        return Path(getattr(self.dictation, "_meeting_tmp_root", meeting.TMP_ROOT))
+
+    def _meeting_menu_text(self, item=None) -> str:
+        if getattr(self.dictation, "meeting_transcribing", False):
+            progress = getattr(self.dictation, "meeting_progress", None)
+            return f"Transcribing meeting\u2026 {progress}" if progress else "Transcribing meeting\u2026"
+        active = getattr(self.dictation, "meeting_active", False)
+        return "Stop meeting recording" if active else "Start meeting recording"
+
+    def _meeting_enabled(self, item=None) -> bool:
+        """Disabled only while transcribing -- a second meeting cannot start until
+        the previous one has been written out."""
+        return not getattr(self.dictation, "meeting_transcribing", False)
+
+    def _meeting_disk_text(self) -> str:
+        """Scratch-audio footprint, so a forgotten recording is visible in the menu."""
+        import meeting
+
+        usage = meeting.wav_usage(self._meeting_tmp_root())
+        if usage.count == 0:
+            return "Meeting audio: none"
+        plural = "" if usage.count == 1 else "s"
+        return f"Meeting audio: {usage.human} ({usage.count} file{plural})"
+
+    def _on_toggle_meeting(self, icon, item) -> None:
+        try:
+            self.dictation.toggle_meeting()
+        except Exception as e:
+            logger.error("Meeting toggle failed: %s", e, exc_info=True)
+
+    def _on_purge_meeting_audio(self, icon, item) -> None:
+        """Delete scratch WAVs, sparing a meeting that is still recording."""
+        import meeting
+
+        recorder = getattr(self.dictation, "meeting", None)
+        keep = recorder.session_dir if getattr(self.dictation, "meeting_active", False) and recorder else None
+        try:
+            freed = meeting.purge_wavs(self._meeting_tmp_root(), keep=keep)
+            logger.info("Deleted meeting audio, freed %.0f MB", freed / 1e6)
+        except Exception as e:
+            logger.error("Could not delete meeting audio: %s", e, exc_info=True)
+
+    def _on_open_meeting_audio(self, icon, item) -> None:
+        root = self._meeting_tmp_root()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            _open_path(root)
+        except Exception as e:
+            logger.error("Could not open %s: %s", root, e, exc_info=True)
 
     def _on_restart_listener(self, icon, item) -> None:
         fn: Optional[Callable[[], None]] = getattr(self.dictation, "restart_hotkey_listener", None)

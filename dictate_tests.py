@@ -1107,3 +1107,605 @@ class TestTrayStatus:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestMeetingConfig:
+    """Config for meeting recording mode."""
+
+    def test_meeting_defaults_when_section_absent(self, mock_config):
+        config = dictate.load_config()
+
+        assert config["meeting_transcript_dir"].endswith("/meetings")
+        assert config["meeting_max_duration_min"] == 120
+        assert config["meeting_silence_stop_min"] == 10
+        assert config["meeting_hotkey"] == ""
+
+    def test_meeting_values_read_from_section(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text()
+            + "\n[meeting]\n"
+            "transcript_dir = ~/Documents/calls\n"
+            "max_duration_min = 90\n"
+            "silence_stop_min = 5\n"
+            "hotkey = shift+f12\n"
+        )
+
+        config = dictate.load_config()
+
+        assert config["meeting_transcript_dir"].endswith("/Documents/calls")
+        assert "~" not in config["meeting_transcript_dir"]
+        assert config["meeting_max_duration_min"] == 90
+        assert config["meeting_silence_stop_min"] == 5
+        assert config["meeting_hotkey"] == "shift+f12"
+
+
+class TestMeetingRunSettingsConfig:
+    """Speech-run VAD knobs, tunable without editing meeting.py."""
+
+    def test_defaults_match_the_meeting_module(self, mock_config):
+        config = dictate.load_config()
+
+        assert config["meeting_run_min_silence_ms"] == dictate.meeting_mod.RUN_MIN_SILENCE_MS
+        assert config["meeting_run_pad_ms"] == dictate.meeting_mod.RUN_PAD_MS
+        assert config["meeting_run_vad_threshold"] == dictate.meeting_mod.RUN_VAD_THRESHOLD
+        assert config["meeting_run_min_speech_ms"] == dictate.meeting_mod.RUN_MIN_SPEECH_MS
+        assert config["meeting_run_max_seconds"] == dictate.meeting_mod.LANGUAGE_WINDOW_S
+        assert config["meeting_min_avg_logprob"] == dictate.meeting_mod.MIN_AVG_LOGPROB
+
+    def test_values_read_from_section(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text()
+            + "\n[meeting]\n"
+            "run_min_silence_ms = 1500\n"
+            "run_pad_ms = 50\n"
+            "run_vad_threshold = 0.7\n"
+            "run_min_speech_ms = 250\n"
+            "run_max_seconds = 20\n"
+            "min_avg_logprob = -2.0\n"
+        )
+
+        config = dictate.load_config()
+
+        assert config["meeting_run_min_silence_ms"] == 1500
+        assert config["meeting_run_pad_ms"] == 50
+        assert config["meeting_run_vad_threshold"] == 0.7
+        assert config["meeting_run_min_speech_ms"] == 250
+        assert config["meeting_run_max_seconds"] == 20.0
+        assert config["meeting_min_avg_logprob"] == -2.0
+
+    def test_config_builds_the_settings_meeting_uses(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text() + "\n[meeting]\nrun_min_silence_ms = 1500\n"
+        )
+
+        settings = dictate.meeting_mod.RunSettings.from_config(dictate.load_config())
+
+        assert settings.min_silence_ms == 1500
+        assert settings.pad_ms == dictate.meeting_mod.RUN_PAD_MS
+
+
+class TestMeetingGlossaryConfig:
+    """Meeting mode primes Whisper with the same glossary dictation uses, unless
+    [meeting] custom_terms overrides it -- interview vocabulary differs from the
+    terms you dictate every day."""
+
+    def test_defaults_to_the_behavior_glossary(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text().replace(
+                "[behavior]", "[behavior]\ncustom_terms = Redis, Kubeflow"
+            )
+        )
+
+        config = dictate.load_config()
+
+        assert config["meeting_custom_terms"] == "Redis, Kubeflow"
+
+    def test_meeting_section_overrides_it(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text() + "\n[meeting]\ncustom_terms = Airflow, idempotency\n"
+        )
+
+        config = dictate.load_config()
+
+        assert config["meeting_custom_terms"] == "Airflow, idempotency"
+        assert config["custom_terms"] != "Airflow, idempotency"
+
+    def test_block_caps_have_the_tuned_defaults(self, mock_config):
+        config = dictate.load_config()
+
+        assert config["meeting_me_max_block_seconds"] == dictate.meeting_mod.ME_MAX_BLOCK_S
+        assert config["meeting_them_max_block_seconds"] == dictate.meeting_mod.THEM_MAX_BLOCK_S
+
+    def test_block_caps_read_from_section(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text()
+            + "\n[meeting]\nme_max_block_seconds = 45\nthem_max_block_seconds = 15\n"
+        )
+
+        config = dictate.load_config()
+
+        assert config["meeting_me_max_block_seconds"] == 45.0
+        assert config["meeting_them_max_block_seconds"] == 15.0
+
+
+class TestParseHotkeySpec:
+    """Meeting mode needs a modifier combo; dictation's hotkey is a single key."""
+
+    def test_bare_key_has_no_modifiers(self):
+        assert dictate.parse_hotkey_spec("f12") == (frozenset(), "f12")
+
+    def test_shift_modifier_is_split_off(self):
+        assert dictate.parse_hotkey_spec("shift+f12") == (frozenset({"shift"}), "f12")
+
+    def test_is_case_and_space_insensitive(self):
+        assert dictate.parse_hotkey_spec(" Shift + F12 ") == (frozenset({"shift"}), "f12")
+
+    def test_supports_several_modifiers(self):
+        assert dictate.parse_hotkey_spec("ctrl+shift+f12") == (
+            frozenset({"ctrl", "shift"}),
+            "f12",
+        )
+
+    def test_empty_spec_means_no_hotkey(self):
+        assert dictate.parse_hotkey_spec("") == (frozenset(), "")
+
+
+class TestTrayMeetingState:
+    """Meeting mode needs its own icon so a live recording is unmistakable."""
+
+    def _dictation(self, **kw):
+        base = dict(model_error=None, _tray_error=None, recording=False,
+                    stopping=False, transcribing=False, meeting_active=False)
+        base["model_loaded"] = SimpleNamespace(is_set=lambda: True)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_meeting_state_is_reported_while_recording_a_meeting(self):
+        import tray_status
+
+        assert tray_status.derive_state(self._dictation(meeting_active=True)) == "meeting"
+
+    def test_meeting_outranks_dictation_recording(self):
+        import tray_status
+
+        d = self._dictation(meeting_active=True, recording=True)
+
+        assert tray_status.derive_state(d) == "meeting"
+
+    def test_errors_still_outrank_meeting(self):
+        import tray_status
+
+        d = self._dictation(meeting_active=True, _tray_error="disk full")
+
+        assert tray_status.derive_state(d) == "error"
+
+    def test_meeting_is_a_known_state_with_an_icon(self):
+        import tray_status
+
+        assert "meeting" in tray_status.STATE_NAMES
+        assert "meeting" in tray_status.load_state_images()
+
+
+class NoBackgroundModelLoad:
+    """Dictation.__init__ spawns a thread building a real WhisperModel (network +
+    disk). Tests supply their own model, so stub the loader out."""
+
+    @pytest.fixture(autouse=True)
+    def _no_model_load(self, monkeypatch):
+        monkeypatch.setattr(dictate.Dictation, "_load_model", lambda self: None)
+
+
+class TestDictationDisabledDuringMeeting(NoBackgroundModelLoad):
+    """Meeting mode must neuter the dictation hotkey.
+
+    If it fired mid-call, transcribed text would be typed into whatever window has
+    focus -- the Zoom chat, a shared doc, anything.
+    """
+
+    def _dictation(self):
+        d = dictate.Dictation(dictate.load_config())
+        d.model_loaded.set()
+        return d
+
+    def test_hotkey_does_not_start_dictation_while_a_meeting_records(self, mock_config):
+        d = self._dictation()
+        scheduled = []
+        d._schedule_hotkey_action = lambda fn, name: scheduled.append(name)
+        d.meeting_active = True
+
+        d.on_press(d.hotkey)
+
+        assert scheduled == []
+
+    def test_hotkey_does_not_stop_dictation_while_a_meeting_records(self, mock_config):
+        d = self._dictation()
+        scheduled = []
+        d._schedule_hotkey_action = lambda fn, name: scheduled.append(name)
+        d.meeting_active = True
+
+        d.on_release(d.hotkey)
+
+        assert scheduled == []
+
+    def test_hotkey_works_normally_when_no_meeting_is_recording(self, mock_config):
+        d = self._dictation()
+        scheduled = []
+        d._schedule_hotkey_action = lambda fn, name: scheduled.append(name)
+
+        d.on_press(d.hotkey)
+
+        assert scheduled == ["start_recording"]
+
+
+class FakeMeetingProc:
+    def __init__(self, cmd, **kw): self.cmd = cmd
+    def terminate(self): pass
+    def wait(self, timeout=None): return 0
+    def poll(self): return None
+
+
+class TestDictationMeetingControl(NoBackgroundModelLoad):
+    def _dictation(self, tmp_path):
+        d = dictate.Dictation(dictate.load_config())
+        d.model_loaded.set()
+        d.config["meeting_transcript_dir"] = str(tmp_path / "transcripts")
+        d._meeting_tmp_root = tmp_path / "tmp"
+        d._meeting_spawn = FakeMeetingProc
+        return d
+
+    def test_starting_a_meeting_suspends_dictation(self, mock_config, tmp_path):
+        d = self._dictation(tmp_path)
+
+        d.start_meeting()
+
+        assert d.meeting_active is True
+        assert d._dictation_suspended() is True
+
+    def test_stopping_a_meeting_resumes_dictation(self, mock_config, tmp_path):
+        d = self._dictation(tmp_path)
+        d.start_meeting()
+
+        d.stop_meeting(transcribe=False)
+
+        assert d.meeting_active is False
+        assert d._dictation_suspended() is False
+
+    def test_starting_twice_does_not_spawn_a_second_meeting(self, mock_config, tmp_path):
+        d = self._dictation(tmp_path)
+        d.start_meeting()
+        first = d.meeting.session_dir
+
+        d.start_meeting()
+
+        assert d.meeting.session_dir == first
+
+
+class TestTrayMeetingMenu:
+    def _tray(self, **kw):
+        import tray_status
+        base = dict(model_error=None, _tray_error=None, recording=False, stopping=False,
+                    transcribing=False, meeting_active=False, config={})
+        base["model_loaded"] = SimpleNamespace(is_set=lambda: True)
+        base.update(kw)
+        return tray_status, tray_status.TrayStatus(SimpleNamespace(**base))
+
+    def test_menu_offers_to_start_a_meeting_when_idle(self):
+        _, tray = self._tray()
+
+        assert tray._meeting_menu_text() == "Start meeting recording"
+
+    def test_menu_offers_to_stop_a_meeting_while_recording(self):
+        _, tray = self._tray(meeting_active=True)
+
+        assert tray._meeting_menu_text() == "Stop meeting recording"
+
+    def test_disk_line_shows_size_and_count_of_scratch_audio(self, tmp_path):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "a" / "mic.wav").write_bytes(b"x" * 2_000_000)
+        _, tray = self._tray()
+        tray.dictation._meeting_tmp_root = tmp_path
+
+        assert tray._meeting_disk_text() == "Meeting audio: 2 MB (1 file)"
+
+    def test_disk_line_reads_clean_when_there_is_no_scratch_audio(self, tmp_path):
+        _, tray = self._tray()
+        tray.dictation._meeting_tmp_root = tmp_path
+
+        assert tray._meeting_disk_text() == "Meeting audio: none"
+
+
+class TestScratchWavPath:
+    """All WAVs this app writes live under one root the tray can size and wipe."""
+
+    def test_debug_recordings_go_under_the_shared_scratch_root(self, tmp_path):
+        import meeting
+
+        path = dictate.scratch_wav_path("recording_20260101_120000.wav", root=tmp_path)
+
+        assert path.parent == tmp_path / "recordings"
+        assert path.parent.is_dir()
+
+    def test_default_root_is_the_shared_soupawhisper_tmp_dir(self):
+        import meeting
+
+        assert str(meeting.TMP_ROOT).endswith("/soupawhisper-streaming")
+
+
+class TestModifierName:
+    def test_recognises_left_and_right_shift_as_shift(self):
+        assert dictate.modifier_name(SimpleNamespace(name="shift_l")) == "shift"
+        assert dictate.modifier_name(SimpleNamespace(name="shift_r")) == "shift"
+        assert dictate.modifier_name(SimpleNamespace(name="shift")) == "shift"
+
+    def test_recognises_ctrl_alt_and_cmd(self):
+        assert dictate.modifier_name(SimpleNamespace(name="ctrl_l")) == "ctrl"
+        assert dictate.modifier_name(SimpleNamespace(name="alt_gr")) == "alt"
+        assert dictate.modifier_name(SimpleNamespace(name="cmd_r")) == "cmd"
+
+    def test_returns_none_for_a_normal_key(self):
+        assert dictate.modifier_name(SimpleNamespace(name="f12")) is None
+
+    def test_returns_none_for_a_character_key_without_a_name(self):
+        assert dictate.modifier_name(SimpleNamespace(char="a")) is None
+
+
+class TestMeetingHotkey(NoBackgroundModelLoad):
+    def _dictation(self, spec="shift+f12", live_mods=()):
+        cfg = dictate.load_config()
+        cfg["meeting_hotkey"] = spec
+        d = dictate.Dictation(cfg)
+        d.model_loaded.set()
+        d._modifier_source = lambda: set(live_mods)
+        d.scheduled = []
+        d._schedule_hotkey_action = lambda fn, name: d.scheduled.append(name)
+        return d
+
+    def test_combo_toggles_meeting_mode(self, mock_config):
+        d = self._dictation(live_mods={"shift"})
+
+        d.on_press(d._meeting_key)
+
+        assert d.scheduled == ["toggle_meeting"]
+
+    def test_bare_key_without_the_modifier_does_not_toggle_meeting(self, mock_config):
+        d = self._dictation()
+
+        d.on_press(d._meeting_key)
+
+        assert "toggle_meeting" not in d.scheduled
+
+    def test_combo_still_works_while_a_meeting_is_recording(self, mock_config):
+        d = self._dictation(live_mods={"shift"})
+        d.meeting_active = True
+
+        d.on_press(d._meeting_key)
+
+        assert d.scheduled == ["toggle_meeting"]
+
+    def test_no_modifier_held_means_no_combo(self, mock_config):
+        d = self._dictation(live_mods=set())
+
+        d.on_press(d._meeting_key)
+
+        assert "toggle_meeting" not in d.scheduled
+
+    def test_no_meeting_hotkey_configured_means_no_combo(self, mock_config):
+        d = self._dictation(spec="")
+
+        assert d._meeting_key is None
+
+
+class TestFileTranscriptionLanguage(NoBackgroundModelLoad):
+    """Dictation locks one language per file; meeting mode does NOT (see
+    meeting.transcribe_windowed), because a call can switch languages."""
+
+    def _dictation_with_wav(self, tmp_path):
+        import wave as w
+        d = dictate.Dictation(dictate.load_config())
+        d.model = MockWhisperModel()
+        d.model_loaded.set()
+        wav = tmp_path / "mic.wav"
+        with w.open(str(wav), "wb") as f:
+            f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000)
+            f.writeframes(b"\0" * 32000)
+        return d, wav
+
+    def test_default_still_locks_one_language_for_dictation(self, mock_config, tmp_path):
+        d, wav = self._dictation_with_wav(tmp_path)
+
+        d.transcribe_file_to_output(str(wav), str(tmp_path / "out.srt"))
+
+        _, kwargs = d.model.transcribe_calls[-1]
+        assert not kwargs.get("multilingual")
+        assert kwargs["language"] is not None
+
+
+class TestMeetingModel(NoBackgroundModelLoad):
+    """Meeting transcription gets its own model instance.
+
+    Sharing dictation's model would serialise the two and make dictation wait for a
+    long meeting transcription; a separate instance also lets us cap its threads.
+    """
+
+    def test_defaults_to_half_the_cores(self, mock_config):
+        config = dictate.load_config()
+
+        assert config["meeting_cpu_threads"] == max(1, (os.cpu_count() or 2) // 2)
+
+    def test_thread_count_is_configurable(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text() + "\n[meeting]\ncpu_threads = 3\n"
+        )
+
+        assert dictate.load_config()["meeting_cpu_threads"] == 3
+
+    def test_meeting_model_is_not_the_dictation_model(self, mock_config, monkeypatch):
+        built = {}
+
+        def fake_model(name, device=None, compute_type=None, cpu_threads=None):
+            built["cpu_threads"] = cpu_threads
+            return MockWhisperModel()
+
+        monkeypatch.setattr(dictate, "WhisperModel", fake_model)
+        d = dictate.Dictation(dictate.load_config())
+        d.model = MockWhisperModel()
+
+        meeting_model = d.meeting_model()
+
+        assert meeting_model is not d.model
+        assert built["cpu_threads"] == max(1, (os.cpu_count() or 2) // 2)
+
+    def test_meeting_model_is_built_once_and_reused(self, mock_config, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            dictate, "WhisperModel",
+            lambda *a, **kw: (calls.append(1), MockWhisperModel())[1],
+        )
+        d = dictate.Dictation(dictate.load_config())
+
+        d.meeting_model(); d.meeting_model()
+
+        assert len(calls) == 1
+
+
+class TestTrayMeetingTranscribingLabel:
+    """Dictation is usable during meeting transcription, so the icon must stay idle -
+    but the menu should still say the job is running."""
+
+    def _tray(self, **kw):
+        import tray_status
+        base = dict(model_error=None, _tray_error=None, recording=False, stopping=False,
+                    transcribing=False, meeting_active=False, meeting_transcribing=False,
+                    config={})
+        base["model_loaded"] = SimpleNamespace(is_set=lambda: True)
+        base.update(kw)
+        return tray_status, tray_status.TrayStatus(SimpleNamespace(**base))
+
+    def test_menu_reports_transcription_in_progress(self):
+        _, tray = self._tray(meeting_transcribing=True)
+
+        assert tray._meeting_menu_text() == "Transcribing meeting…"
+
+    def test_menu_item_is_disabled_while_transcribing(self):
+        _, tray = self._tray(meeting_transcribing=True)
+
+        assert tray._meeting_enabled() is False
+
+    def test_icon_stays_idle_so_dictation_looks_available(self):
+        ts, tray = self._tray(meeting_transcribing=True)
+
+        assert ts.derive_state(tray.dictation) == "idle"
+
+    def test_menu_returns_to_start_when_transcription_finishes(self):
+        _, tray = self._tray(meeting_transcribing=False)
+
+        assert tray._meeting_menu_text() == "Start meeting recording"
+        assert tray._meeting_enabled() is True
+
+
+class TestMeetingHotkeyUsesLiveModifiers(NoBackgroundModelLoad):
+    """Regression: X11 reports Shift's RELEASE as a different keysym (65032, an ISO
+    group-switch) when layout switching is bound to Shift, so press/release tracking
+    desynchronises permanently. Modifier state must be read live at trigger time."""
+
+    def _dictation(self, live_mods):
+        cfg = dictate.load_config()
+        cfg["key"] = "f12"          # user's real setup: F12 dictates, Shift+F12 meets
+        cfg["meeting_hotkey"] = "shift+f12"
+        d = dictate.Dictation(cfg)
+        d.model_loaded.set()
+        d._modifier_source = lambda: set(live_mods)
+        d.scheduled = []
+        d._schedule_hotkey_action = lambda fn, name: d.scheduled.append(name)
+        return d
+
+    def test_bare_key_does_not_toggle_meeting_when_shift_is_stale(self, mock_config):
+        # The reported bug: F12 alone started meeting mode because 'shift' was stuck.
+        d = self._dictation(live_mods=set())
+        d._held_modifiers = {"shift"}  # stale, never cleared by a release event
+
+        d.on_press(d._meeting_key)
+
+        assert "toggle_meeting" not in d.scheduled
+        assert d.scheduled == ["start_recording"]
+
+    def test_combo_toggles_meeting_when_shift_is_really_held(self, mock_config):
+        d = self._dictation(live_mods={"shift"})
+
+        d.on_press(d._meeting_key)
+
+        assert d.scheduled == ["toggle_meeting"]
+
+    def test_extra_stale_modifiers_do_not_block_the_combo(self, mock_config):
+        # The other reported bug: Shift+F12 fell through to dictation because a stale
+        # ctrl/alt made the tracked set unequal to {"shift"}.
+        d = self._dictation(live_mods={"shift"})
+        d._held_modifiers = {"shift", "ctrl", "alt"}
+
+        d.on_press(d._meeting_key)
+
+        assert d.scheduled == ["toggle_meeting"]
+
+
+class TestStreamingListenerTracksReleases:
+    def test_streaming_listener_registers_on_release(self, mock_config, monkeypatch):
+        monkeypatch.setattr(dictate.Dictation, "_load_model", lambda self: None)
+        d = dictate.StreamingDictation(dictate.load_config())
+
+        d._create_hotkey_listener()
+
+        kwargs = dictate.keyboard.Listener.call_args.kwargs
+        assert "on_release" in kwargs
+
+
+class TestTrayShowsTranscriptionProgress:
+    def _tray(self, **kw):
+        import tray_status
+        base = dict(model_error=None, _tray_error=None, recording=False, stopping=False,
+                    transcribing=False, meeting_active=False, meeting_transcribing=False,
+                    meeting_progress=None, config={})
+        base["model_loaded"] = SimpleNamespace(is_set=lambda: True)
+        base.update(kw)
+        return tray_status, tray_status.TrayStatus(SimpleNamespace(**base))
+
+    def test_shows_percentage_while_transcribing(self):
+        _, tray = self._tray(meeting_transcribing=True, meeting_progress="mic 45%")
+
+        assert tray._meeting_menu_text() == "Transcribing meeting… mic 45%"
+
+    def test_falls_back_to_plain_label_before_the_first_window(self):
+        _, tray = self._tray(meeting_transcribing=True, meeting_progress=None)
+
+        assert tray._meeting_menu_text() == "Transcribing meeting…"
+
+
+class TestMeetingKeepAudioConfig:
+    def test_audio_is_deleted_by_default(self, mock_config):
+        assert dictate.load_config()["meeting_keep_audio"] is False
+
+    def test_can_be_enabled_for_debugging(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text() + "\n[meeting]\nkeep_audio = true\n"
+        )
+
+        assert dictate.load_config()["meeting_keep_audio"] is True
+
+
+class TestDictationBuildsMeetingGlossary(NoBackgroundModelLoad):
+    def test_meeting_terms_kwargs_built_from_meeting_custom_terms(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text() + "\n[meeting]\ncustom_terms = Redis, Kubeflow\n"
+        )
+
+        d = dictate.Dictation(dictate.load_config())
+
+        assert "Redis" in d.meeting_terms_kwargs["hotwords"]
+        assert "Kubeflow" in d.meeting_terms_kwargs["initial_prompt"]
+
+    def test_empty_glossary_yields_no_kwargs(self, mock_config):
+        # mock_config defines no custom_terms at all -- the empty case.
+        pass
+
+        d = dictate.Dictation(dictate.load_config())
+
+        assert d.meeting_terms_kwargs == {}
