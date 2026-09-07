@@ -146,6 +146,101 @@ Default hotkey is **F12** (configurable). Ctrl+C quits a foreground process.
 
 ---
 
+## Meeting recording
+
+Records a call — Google Meet, Zoom, Teams, anything — as **two separate tracks**, then transcribes both and merges them into one speaker-labelled Markdown transcript. Because each speaker has their own file, "who said what" comes from the filename; no diarization model is involved.
+
+- **Your voice** — the default source (mic).
+- **Everyone else** — the default sink's *monitor*, i.e. whatever your speakers play. This works below the app layer, so the meeting app neither cooperates nor notices.
+
+Capturing the other side means recording what your speakers play, which is an OS-level facility rather than something the meeting app offers. That is currently wired to PipeWire's `pw-record`, so meeting mode is Linux-only for now; the equivalent on macOS needs a virtual audio device and on Windows WASAPI loopback. Dictation itself runs on all three.
+
+> **Use headphones.** On open speakers your mic also picks up the other participants, so their words land on **both** tracks and are repeated under `Me:`. Headphones make the two tracks cleanly separate.
+
+Meeting mode and dictation are **mutually exclusive**: while a meeting records, the dictation hotkey does nothing. That is deliberate — a stray F12 mid-call would type transcribed text into whatever window has focus.
+
+### Using it
+
+Start and stop from the tray menu (**Start meeting recording**), or set `hotkey = shift+f12` under `[meeting]`. The tray icon switches to a two-people glyph for the whole call, and the menu shows how much scratch audio is on disk with a **Delete recorded audio files** action.
+
+Nothing is transcribed while recording — two `pw-record` processes write WAV straight to disk at near-zero CPU, so nothing competes with the video call. Transcription runs once, after you stop.
+
+### Where files go
+
+| What | Where | Lifetime |
+|---|---|---|
+| Merged transcript (`.md`) | `transcript_dir` (default `~/Documents/meetings`) **and** the session dir | Kept |
+| Per-track `.srt`, optional `.words.json`, `transcribe.log` | `$TMPDIR/soupawhisper-streaming/meetings/<timestamp>/` | Kept until the 30-day `/tmp` sweep |
+| Track audio (`.wav`) | same session dir | Deleted once the transcript is written |
+
+Audio is deleted **only after** the transcript lands. If transcription fails, the WAVs are kept and the notification says where — they are the only copy of the meeting.
+
+### Speed
+
+Meeting transcription uses its **own** model instance, so dictation is usable the moment recording stops rather than queueing behind it. `cpu_threads` (default: half the logical cores) caps it.
+
+Measured on an i5-10300H (4 physical cores + HT), 57s of silence-heavy audio:
+
+| `cpu_threads` | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| time | 32.2s | 19.1s | **12.9s** | 37.1s |
+
+Past half the logical cores it oversubscribes and gets slower, so that default is both the fastest setting and the one that leaves CPU for dictation.
+
+Progress goes to `transcribe.log` in the session directory — one line per speech run with its offset, duration and detected language, plus an ETA every 10% — and to the tray as `Transcribing meeting… mic 45%`.
+
+### Quality
+
+**What works.** Each track is cut into speech runs and the language is detected per run, so a call that switches languages decodes correctly and timestamps land on real speech. Set `language_allowlist` (e.g. `en, ru`) to keep detection between plausible languages; short or noisy runs otherwise score highest on things like `la`. Silence is never sent to Whisper, and low-confidence output is dropped — together these stop the invented text Whisper produces when it has nothing to hear (`Thanks for watching!`, subtitle-translator credits).
+
+**What does not.** Strongly accented speech is sometimes detected as the wrong language and comes back as phonetic nonsense; on one 73-minute interview this hit 9% of runs. A larger model detects better if you can afford the decode time. Long monologues split every `run_max_seconds`, so a language change inside one is only caught at that boundary.
+
+**Tuning.** Set `keep_audio = true`, record a sample, then re-run the same WAVs with different values and compare — `transcribe.log` shows what each run was detected as.
+
+| Setting | Default | Raise it to… | Lower it to… |
+|---|---|---|---|
+| `run_min_silence_ms` | `700` | keep a sentence's pauses in one run | let the language switch more often |
+| `run_pad_ms` | `200` | stop clipped first/last words | keep neighbouring noise out |
+| `run_vad_threshold` | `0.5` | admit only clear speech | catch quiet or distant talk |
+| `run_min_speech_ms` | `0` | drop coughs and clicks | keep one-word answers |
+| `run_max_seconds` | `30` | transcribe faster | let a long monologue change language |
+| `min_avg_logprob` | `-1.5` | cut more invented text | keep more short real words |
+| `me_max_block_seconds` | `60` | keep a long answer whole | get finer timestamps |
+| `them_max_block_seconds` | `20` | keep a long answer whole | separate speakers' turns better |
+
+`[behavior] custom_terms` and `reject_phrases` apply here too. A glossary fixes domain words — without it Whisper wrote `sync 8 group` and `cup flow, air flow`, with it `sync.WaitGroup` and `Kubeflow, Airflow` — but a listed term can also be forced onto audio that never contained it, so keep the list to words that actually recur.
+
+### Measuring conversation timing
+
+Every transcript opens with YAML frontmatter summarising the conversation:
+
+```yaml
+---
+me_them_speaking_ratio: 5.36        # your speaking time / theirs
+me_speaking_s: 111.4
+them_speaking_s: 20.8
+me_wpm_avg: 147.6           # words per minute, averaged over your turns
+me_wpm_stdev: 13.0
+them_wpm_avg: 173.6
+them_wpm_stdev: 3.6
+me_think_time_avg_s: 1.8    # your pause before answering them
+me_think_time_stdev_s: 0.7
+them_think_time_avg_s: 3.2
+them_think_time_stdev_s:    # empty when there was too little to measure
+---
+```
+
+Rates and pauses are measured per turn, not per subtitle cue, so a half-second cue holding one word cannot skew them. Think time counts only pauses where the speaker actually changed — a gap between two of your own turns is you drawing breath, not deciding — and overlaps are excluded rather than averaged in as negative waits. Spread is the population standard deviation, in the same unit as the average.
+
+For finer analysis, `word_timestamps = true` additionally writes `mic.words.json` and `them.words.json` with per-word start and end times. Both tracks share one clock, so these support response latency, pause length, speaking rate, talk-time ratio and interruption counts. It costs extra transcription time and leaves the `.srt` and `.md` output unchanged.
+
+
+### Requirements
+
+`pw-record` (from `pipewire-bin` / `pipewire-utils`). `parec` is deliberately not used: on PipeWire's PulseAudio shim it was measured dropping the first ~2 s of every mic capture. The participants' track uses `stream.capture.sink=true`, so it follows the default sink — plugging in headphones mid-meeting does not leave it recording a dead device.
+
+---
+
 ## Troubleshooting
 
 **No audio / wrong device**
