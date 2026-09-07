@@ -228,21 +228,21 @@ class TestStreamingDictation:
         d.config = {"reject_phrases": ""}
         d._reject_phrase_set = d._build_reject_phrase_set()
         assert d._reject_phrase_set == frozenset()
-        assert d._should_reject_streaming_chunk("thank you") is False
+        assert d.should_reject_text("thank you") is False
 
     def test_reject_phrases_exact_whole_chunk_match(self):
         d = dictate.StreamingDictation.__new__(dictate.StreamingDictation)
         d.config = {"reject_phrases": "thank you, um, hmm"}
         d._reject_phrase_set = d._build_reject_phrase_set()
 
-        assert d._should_reject_streaming_chunk("thank you") is True
-        assert d._should_reject_streaming_chunk("Thank you!!!") is True
-        assert d._should_reject_streaming_chunk("um...") is True
-        assert d._should_reject_streaming_chunk("Hmm..") is True
+        assert d.should_reject_text("thank you") is True
+        assert d.should_reject_text("Thank you!!!") is True
+        assert d.should_reject_text("um...") is True
+        assert d.should_reject_text("Hmm..") is True
 
         # Multiple phrases / extra words must NOT be rejected.
-        assert d._should_reject_streaming_chunk("thank you thanks") is False
-        assert d._should_reject_streaming_chunk("um well") is False
+        assert d.should_reject_text("thank you thanks") is False
+        assert d.should_reject_text("um well") is False
 
 
 class TestCustomTerms:
@@ -302,7 +302,7 @@ class TestCustomTerms:
         config = dictate.load_config()
         d = dictate.Dictation(config)
         d.model_loaded.wait(timeout=1.0)
-        assert d._custom_terms_kwargs == {}
+        assert d.custom_terms_kwargs == {}
 
     def test_dictation_caches_kwargs_when_configured(self, mock_config, mock_whisper_model, mock_xdotool):
         content = mock_config.read_text()
@@ -315,7 +315,7 @@ class TestCustomTerms:
         config = dictate.load_config()
         d = dictate.Dictation(config)
         d.model_loaded.wait(timeout=1.0)
-        assert d._custom_terms_kwargs == {
+        assert d.custom_terms_kwargs == {
             "initial_prompt": "Glossary: Claude, Kubernetes.",
             "hotwords": "Claude Kubernetes",
         }
@@ -1189,26 +1189,15 @@ class TestMeetingGlossaryConfig:
     [meeting] custom_terms overrides it -- interview vocabulary differs from the
     terms you dictate every day."""
 
-    def test_defaults_to_the_behavior_glossary(self, mock_config):
+    def test_meeting_has_no_glossary_key_of_its_own(self, mock_config):
+        # One glossary for every mode: [behavior] custom_terms.
         mock_config.write_text(
-            mock_config.read_text().replace(
-                "[behavior]", "[behavior]\ncustom_terms = Redis, Kubeflow"
-            )
+            mock_config.read_text() + "\n[meeting]\ncustom_terms = Airflow\n"
         )
 
         config = dictate.load_config()
 
-        assert config["meeting_custom_terms"] == "Redis, Kubeflow"
-
-    def test_meeting_section_overrides_it(self, mock_config):
-        mock_config.write_text(
-            mock_config.read_text() + "\n[meeting]\ncustom_terms = Airflow, idempotency\n"
-        )
-
-        config = dictate.load_config()
-
-        assert config["meeting_custom_terms"] == "Airflow, idempotency"
-        assert config["custom_terms"] != "Airflow, idempotency"
+        assert "meeting_custom_terms" not in config
 
     def test_block_caps_have_the_tuned_defaults(self, mock_config):
         config = dictate.load_config()
@@ -1691,21 +1680,34 @@ class TestMeetingKeepAudioConfig:
         assert dictate.load_config()["meeting_keep_audio"] is True
 
 
-class TestDictationBuildsMeetingGlossary(NoBackgroundModelLoad):
-    def test_meeting_terms_kwargs_built_from_meeting_custom_terms(self, mock_config):
+class TestSharedGlossaryAndRejectPhrases(NoBackgroundModelLoad):
+    """Both are [behavior] settings that every mode reads off the base Dictation."""
+
+    def test_glossary_is_built_on_the_base_dictation(self, mock_config):
         mock_config.write_text(
-            mock_config.read_text() + "\n[meeting]\ncustom_terms = Redis, Kubeflow\n"
+            mock_config.read_text().replace(
+                "[behavior]", "[behavior]\ncustom_terms = Redis, Kubeflow"
+            )
         )
 
         d = dictate.Dictation(dictate.load_config())
 
-        assert "Redis" in d.meeting_terms_kwargs["hotwords"]
-        assert "Kubeflow" in d.meeting_terms_kwargs["initial_prompt"]
+        assert "Redis" in d.custom_terms_kwargs["hotwords"]
+        assert "Kubeflow" in d.custom_terms_kwargs["initial_prompt"]
 
     def test_empty_glossary_yields_no_kwargs(self, mock_config):
-        # mock_config defines no custom_terms at all -- the empty case.
-        pass
+        d = dictate.Dictation(dictate.load_config())
+
+        assert d.custom_terms_kwargs == {}
+
+    def test_reject_predicate_is_available_without_streaming(self, mock_config):
+        mock_config.write_text(
+            mock_config.read_text().replace(
+                "[behavior]", "[behavior]\nreject_phrases = thank you, um"
+            )
+        )
 
         d = dictate.Dictation(dictate.load_config())
 
-        assert d.meeting_terms_kwargs == {}
+        assert d.should_reject_text("Thank you!!!") is True
+        assert d.should_reject_text("thank you for that") is False

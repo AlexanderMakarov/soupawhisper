@@ -832,7 +832,7 @@ class TestGlossaryReachesTheModel:
         )
         model = GlossaryModel()
         d = ProgressDictation(model=model, keep_audio=True)
-        d.meeting_terms_kwargs = {"hotwords": "Redis Kubeflow"}
+        d.custom_terms_kwargs = {"hotwords": "Redis Kubeflow"}
 
         meeting.finish_session(d, session, tmp_path / "docs")
 
@@ -871,3 +871,176 @@ class TestBlockLengthDefaults:
 
         assert seen["me_max_block_s"] == 45.0
         assert seen["them_max_block_s"] == 15.0
+
+
+class TestRejectPhrasesSharedWithDictation:
+    """reject_phrases is one [behavior] setting for every mode: the noise it filters
+    ("thank you", "um") is Whisper's, not any one mode's."""
+
+    def session(self, tmp_path):
+        import wave as w
+        d = tmp_path / "2026-09-07_120000"
+        d.mkdir(parents=True)
+        for name in ("mic.wav", "them.wav"):
+            with w.open(str(d / name), "wb") as f:
+                f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000)
+                f.writeframes(b"\x00\x00" * 16000)
+        return d
+
+    def dictation(self, monkeypatch, texts, reject=None):
+        monkeypatch.setattr(
+            meeting, "speech_runs",
+            lambda audio, sample_rate=16000, settings=None: [(0, 16000)],
+        )
+
+        class Model(RunModel):
+            def transcribe(self, audio, **kw):
+                self.calls.append(kw.get("language"))
+                segs = [FakeSegment(float(i), float(i) + 1.0, t)
+                        for i, t in enumerate(texts)]
+                return segs, SimpleNamespace(duration=1.0)
+
+        d = ProgressDictation(model=Model(), keep_audio=True)
+        if reject is not None:
+            d.should_reject_text = lambda t: t.strip().lower().strip(".!") in reject
+        return d
+
+    def test_a_cue_matching_a_reject_phrase_is_dropped(self, tmp_path, monkeypatch):
+        d = self.dictation(monkeypatch, ["Thank you.", "Real content here."],
+                           reject={"thank you"})
+
+        out = meeting.finish_session(d, self.session(tmp_path), tmp_path / "docs")
+
+        assert "Thank you" not in out.read_text()
+        assert "Real content here." in out.read_text()
+
+    def test_partial_matches_are_kept(self, tmp_path, monkeypatch):
+        d = self.dictation(monkeypatch, ["Thank you for the answer."],
+                           reject={"thank you"})
+
+        out = meeting.finish_session(d, self.session(tmp_path), tmp_path / "docs")
+
+        assert "Thank you for the answer." in out.read_text()
+
+    def test_works_without_a_reject_predicate(self, tmp_path, monkeypatch):
+        d = self.dictation(monkeypatch, ["Thank you."])
+
+        out = meeting.finish_session(d, self.session(tmp_path), tmp_path / "docs")
+
+        assert "Thank you." in out.read_text()
+
+
+class TestGlossaryIsTheSharedOne:
+    def test_finish_session_reads_the_shared_custom_terms(self, tmp_path, monkeypatch):
+        import wave as w
+        session = tmp_path / "2026-09-07_120000"
+        session.mkdir(parents=True)
+        for name in ("mic.wav", "them.wav"):
+            with w.open(str(session / name), "wb") as f:
+                f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000)
+                f.writeframes(b"\x00\x00" * 16000)
+        monkeypatch.setattr(
+            meeting, "speech_runs",
+            lambda audio, sample_rate=16000, settings=None: [(0, 16000)],
+        )
+        model = GlossaryModel()
+        d = ProgressDictation(model=model, keep_audio=True)
+        d.custom_terms_kwargs = {"hotwords": "Redis Kubeflow"}
+
+        meeting.finish_session(d, session, tmp_path / "docs")
+
+        assert model.kwargs[0]["hotwords"] == "Redis Kubeflow"
+
+
+class WordModel(RunModel):
+    """Model stub returning per-word timings, as word_timestamps=True does."""
+
+    def transcribe(self, audio, **kw):
+        self.calls.append(kw.get("language"))
+        self.kwargs = getattr(self, "kwargs", []) + [kw]
+        seg = FakeSegment(0.5, 1.5, "hello world")
+        seg.words = [SimpleNamespace(start=0.5, end=0.9, word=" hello", probability=0.98),
+                     SimpleNamespace(start=1.0, end=1.5, word=" world", probability=0.91)]
+        return [seg], SimpleNamespace(duration=len(audio) / 16000)
+
+
+class TestWordTimestamps:
+    """Per-word timings, for measuring pauses and response latency."""
+
+    def audio(self):
+        return np.zeros(20 * 16000, dtype=np.float32)
+
+    def test_off_by_default(self):
+        model = WordModel()
+
+        meeting.transcribe_runs(model, self.audio(), find_runs=runs_at((1.0, 3.0)))
+
+        assert model.kwargs[0].get("word_timestamps") in (None, False)
+
+    def test_requested_when_enabled(self):
+        model = WordModel()
+
+        meeting.transcribe_runs(
+            model, self.audio(), find_runs=runs_at((1.0, 3.0)),
+            settings=meeting.RunSettings(word_timestamps=True),
+        )
+
+        assert model.kwargs[0]["word_timestamps"] is True
+
+    def test_words_are_offset_onto_the_meeting_clock(self):
+        model = WordModel()
+
+        cues = meeting.transcribe_runs(
+            model, self.audio(), find_runs=runs_at((10.0, 13.0)),
+            settings=meeting.RunSettings(word_timestamps=True),
+        )
+
+        # Run starts at 10s, so its 0.5s word sits at 10.5s of the meeting.
+        assert [round(w.start, 2) for w in cues[0].words] == [10.5, 11.0]
+        assert [w.text for w in cues[0].words] == ["hello", "world"]
+
+    def test_cues_have_no_words_when_disabled(self):
+        model = WordModel()
+
+        cues = meeting.transcribe_runs(model, self.audio(), find_runs=runs_at((1.0, 3.0)))
+
+        assert cues[0].words == []
+
+
+class TestWordTimestampFile:
+    def session(self, tmp_path):
+        import wave as w
+        d = tmp_path / "2026-09-07_120000"
+        d.mkdir(parents=True)
+        for name in ("mic.wav", "them.wav"):
+            with w.open(str(d / name), "wb") as f:
+                f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000)
+                f.writeframes(b"\x00\x00" * 16000)
+        return d
+
+    def run(self, tmp_path, monkeypatch, enabled):
+        monkeypatch.setattr(
+            meeting, "speech_runs",
+            lambda audio, sample_rate=16000, settings=None: [(0, 16000)],
+        )
+        d = ProgressDictation(model=WordModel(), keep_audio=True)
+        d.config["meeting_word_timestamps"] = enabled
+        session = self.session(tmp_path)
+        meeting.finish_session(d, session, tmp_path / "docs")
+        return session
+
+    def test_words_json_written_when_enabled(self, tmp_path, monkeypatch):
+        import json
+        session = self.run(tmp_path, monkeypatch, True)
+
+        data = json.loads((session / "mic.words.json").read_text())
+
+        assert data[0]["text"] == "hello world"
+        assert data[0]["words"][0] == {
+            "start": 0.5, "end": 0.9, "text": "hello", "probability": 0.98
+        }
+
+    def test_no_file_when_disabled(self, tmp_path, monkeypatch):
+        session = self.run(tmp_path, monkeypatch, False)
+
+        assert not (session / "mic.words.json").exists()

@@ -146,12 +146,14 @@ Default hotkey is **F12** (configurable). Ctrl+C quits a foreground process.
 
 ---
 
-## Meeting recording (Linux / PipeWire)
+## Meeting recording
 
 Records a call — Google Meet, Zoom, Teams, anything — as **two separate tracks**, then transcribes both and merges them into one speaker-labelled Markdown transcript. Because each speaker has their own file, "who said what" comes from the filename; no diarization model is involved.
 
 - **Your voice** — the default source (mic).
 - **Everyone else** — the default sink's *monitor*, i.e. whatever your speakers play. This works below the app layer, so the meeting app neither cooperates nor notices.
+
+Capturing the other side means recording what your speakers play, which is an OS-level facility rather than something the meeting app offers. That is currently wired to PipeWire's `pw-record`, so meeting mode is Linux-only for now; the equivalent on macOS needs a virtual audio device and on Windows WASAPI loopback. Dictation itself runs on all three.
 
 > **Use headphones.** On open speakers your mic also picks up the other participants, so their words land on **both** tracks and are repeated under `Me:`. Headphones make the two tracks cleanly separate.
 
@@ -168,16 +170,10 @@ Nothing is transcribed while recording — two `pw-record` processes write WAV s
 | What | Where | Lifetime |
 |---|---|---|
 | Merged transcript (`.md`) | `transcript_dir` (default `~/Documents/meetings`) **and** the session dir | Kept |
-| Per-track `.srt` + `transcribe.log` | `$TMPDIR/soupawhisper-streaming/meetings/<timestamp>/` | Kept until the 30-day `/tmp` sweep |
+| Per-track `.srt`, optional `.words.json`, `transcribe.log` | `$TMPDIR/soupawhisper-streaming/meetings/<timestamp>/` | Kept until the 30-day `/tmp` sweep |
 | Track audio (`.wav`) | same session dir | Deleted once the transcript is written |
 
 Audio is deleted **only after** the transcript lands. If transcription fails, the WAVs are kept and the notification says where — they are the only copy of the meeting.
-
-### Languages
-
-Each track is cut into **speech runs** by the silero VAD, and the language is detected on each run separately. Set `language_allowlist` (e.g. `en, ru`) to keep the choice between plausible languages — short or noisy runs otherwise score highest on things like `la`. A run longer than 30s is split, so a long monologue is not locked to whatever its first 30s scored.
-
-Fixed 30-second windows were tried first and are wrong twice over. Measured on a real bilingual track: an English sentence at 2.8s vanished entirely because Russian later in the *same window* scored 0.91, and because the window opened in silence Whisper stretched its segment back to the window start, stamping speech spoken at 10s as `00:00:00`. Cutting on speech boundaries fixes both — each utterance is scored on its own audio, and a cue's time comes from the run's real offset rather than a timestamp token Whisper picked over a silent lead-in.
 
 ### Speed
 
@@ -189,53 +185,35 @@ Measured on an i5-10300H (4 physical cores + HT), 57s of silence-heavy audio:
 |---|---|---|---|---|
 | time | 32.2s | 19.1s | **12.9s** | 37.1s |
 
-8 threads oversubscribes and is *slower than single-threaded*, so half the logical cores is simultaneously the fastest setting and the one that leaves CPU for dictation.
+Past half the logical cores it oversubscribes and gets slower, so that default is both the fastest setting and the one that leaves CPU for dictation.
 
-Run splitting costs decode time on a dense track — measured 5.4s vs 2.0s for a 14.4s mic track holding three runs, because each run pays its own encoder pass. It pays for itself on a real meeting, where most of a track is silence that is now never decoded at all. It is not optional regardless: whole-window decoding loses whole utterances (see **Languages**).
+Progress goes to `transcribe.log` in the session directory — one line per speech run with its offset, duration and detected language, plus an ETA every 10% — and to the tray as `Transcribing meeting… mic 45%`.
 
-`transcribe.log` in the session directory records one line per run with its offset, duration and detected language — the language timeline for the whole meeting — plus an ETA every 10%. The tray shows `Transcribing meeting… mic 45%`.
+### Quality
 
-### Hallucinations
+**What works.** Each track is cut into speech runs and the language is detected per run, so a call that switches languages decodes correctly and timestamps land on real speech. Set `language_allowlist` (e.g. `en, ru`) to keep detection between plausible languages; short or noisy runs otherwise score highest on things like `la`. Silence is never sent to Whisper, and low-confidence output is dropped — together these stop the invented text Whisper produces when it has nothing to hear (`Thanks for watching!`, subtitle-translator credits).
 
-Whisper invents text from its training data when given nothing to hear — Russian subtitle-translator credits (`Редактор субтитров …`), `Thanks for watching!`, `You`. Two guards:
+**What does not.** Strongly accented speech is sometimes detected as the wrong language and comes back as phonetic nonsense; on one 73-minute interview this hit 9% of runs. A larger model detects better if you can afford the decode time. Long monologues split every `run_max_seconds`, so a language change inside one is only caught at that boundary.
 
-- **Only speech runs are sent to the model.** Silence between runs never reaches Whisper. The silero VAD used for this is stricter than the webrtcvad ratio it replaced, which scored broadband noise 0.9+; silero rejects it outright.
-- **Low-confidence segments are dropped.** Noise the VAD *does* accept still makes Whisper invent text, but its own `avg_logprob` separates them: measured **-2.2 on invented credits vs -0.26 on a clear sentence**. Anything below `-1.5` is discarded and counted in `transcribe.log`. The floor is below Whisper's `-1.0` default on purpose — a real one-word answer (`Всё.`) measured **-1.09**, and the earlier `-1.0` threw it away.
+**Tuning.** Set `keep_audio = true`, record a sample, then re-run the same WAVs with different values and compare — `transcribe.log` shows what each run was detected as.
 
-### Vocabulary and block length
-
-Meeting transcription is primed with `[meeting] custom_terms`, which defaults to the dictation glossary in `[behavior]`. Measured on a real interview: without priming Whisper wrote `sync 8 group` and `cup flow, air flow`; with it, `sync.WaitGroup` and `Kubeflow, Airflow`. The trade is real in both directions — a listed term can be forced onto audio that did not contain it (`outage of such red limits` became `outage of Saga Red Limits`), so keep the list to words that actually recur and verify against a kept recording.
-
-`me_max_block_seconds` (default 60) and `them_max_block_seconds` (default 20) cap how long one speaker runs before the transcript starts a new block. Measured against a professional transcript of the same 73-minute interview:
-
-| `me_max_block_seconds` | blocks | longest block |
-|---|---|---|
-| 600 (old default) | 47 | 415 words |
-| 120 | 60 | 212 words |
-| **60** | **86** | **110 words** |
-| 30 | 147 | 64 words |
-| *reference transcript* | *88* | *121 words* |
-
-### Tuning the speech-run VAD
-
-All six knobs live in `[meeting]` and are commented out in `config.example.ini` with their defaults. Set `keep_audio = true`, record a sample, then re-run the same WAVs with different values and diff the transcripts — `transcribe.log` lists every run with its offset, duration and detected language.
-
-| Key | Default | Raise it to… | Lower it to… |
+| Setting | Default | Raise it to… | Lower it to… |
 |---|---|---|---|
-| `run_min_silence_ms` | `700` | keep a sentence's own pauses in one run | let the language switch more often |
-| `run_pad_ms` | `200` | stop clipped leading consonants | keep neighbouring noise out of a run |
+| `run_min_silence_ms` | `700` | keep a sentence's pauses in one run | let the language switch more often |
+| `run_pad_ms` | `200` | stop clipped first/last words | keep neighbouring noise out |
 | `run_vad_threshold` | `0.5` | admit only clear speech | catch quiet or distant talk |
-| `run_min_speech_ms` | `0` | drop coughs and clicks that became runs | keep one-word answers |
-| `run_max_seconds` | `30` | spend fewer encoder passes | let a long monologue change language |
-| `min_avg_logprob` | `-1.5` | cut more hallucinated text | keep more short real words |
+| `run_min_speech_ms` | `0` | drop coughs and clicks | keep one-word answers |
+| `run_max_seconds` | `30` | transcribe faster | let a long monologue change language |
+| `min_avg_logprob` | `-1.5` | cut more invented text | keep more short real words |
+| `me_max_block_seconds` | `60` | keep a long answer whole | get finer timestamps |
+| `them_max_block_seconds` | `20` | keep a long answer whole | separate speakers' turns better |
 
-Measured on a real 14.4 s mic track, defaults give three runs — `2.8-4.2`, `10.1-12.6`, `13.3-14.4`. `run_min_silence_ms = 3000` merges the last two into `10.1-14.4`; `run_min_speech_ms = 2000` leaves only `10.1-12.6`.
+`[behavior] custom_terms` and `reject_phrases` apply here too. A glossary fixes domain words — without it Whisper wrote `sync 8 group` and `cup flow, air flow`, with it `sync.WaitGroup` and `Kubeflow, Airflow` — but a listed term can also be forced onto audio that never contained it, so keep the list to words that actually recur.
 
-Note these are separate from the **auto-stop** silence watchdog (`silence_stop_min`), which uses webrtcvad to decide the meeting is over. Changing the run knobs does not affect auto-stop, and vice versa. The `[streaming]` VAD keys apply to dictation only and are never read by meeting mode.
+### Measuring conversation timing
 
-Set `keep_audio = true` to retain the WAVs and re-run a bad transcript with different settings.
+`word_timestamps = true` additionally writes `mic.words.json` and `them.words.json` with per-word start and end times. Both tracks share one clock, so these support response latency, pause length, speaking rate, talk-time ratio and interruption counts. It costs extra transcription time and leaves the `.srt` and `.md` output unchanged.
 
-Budget roughly **230 MB per hour** (both tracks, 16 kHz mono). `max_duration_min` (default 120) hard-stops a forgotten recording, and `silence_stop_min` (default 10) stops once *both* tracks have been silent that long — both must be quiet, since monitor-only silence just means you are the one talking.
 
 ### Requirements
 

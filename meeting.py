@@ -7,13 +7,14 @@ Markdown transcript.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
 import tempfile
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -77,6 +78,9 @@ RUN_PAD_MS = 200
 # duration drops blips (0 = keep everything the VAD called speech).
 RUN_VAD_THRESHOLD = 0.5
 RUN_MIN_SPEECH_MS = 0
+# Per-word timings, for measuring pauses and response latency. Off by default: it
+# adds a cross-attention alignment pass per run.
+WORD_TIMESTAMPS = False
 # Backstop for noise the VAD still accepts as speech, which makes Whisper invent
 # text. Its avg_logprob separates the two -- measured -2.2 on invented credits vs
 # -0.26 on a clear sentence. The floor sits at -1.5, not at Whisper's -1.0 default:
@@ -187,12 +191,23 @@ def purge_wavs(root: Path = TMP_ROOT, keep: Path | None = None) -> int:
 
 
 @dataclass
+class Word:
+    """One word with its own span, from Whisper's cross-attention alignment."""
+
+    start: float
+    end: float
+    text: str
+    probability: float
+
+
+@dataclass
 class Cue:
     """One subtitle cue: a timestamped span of transcribed speech."""
 
     start: float
     end: float
     text: str
+    words: list["Word"] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +304,7 @@ class RunSettings:
     min_speech_ms: int = RUN_MIN_SPEECH_MS
     max_run_s: float = LANGUAGE_WINDOW_S
     min_avg_logprob: float = MIN_AVG_LOGPROB
+    word_timestamps: bool = WORD_TIMESTAMPS
 
     _KEYS = {
         "min_silence_ms": "meeting_run_min_silence_ms",
@@ -297,6 +313,7 @@ class RunSettings:
         "min_speech_ms": "meeting_run_min_speech_ms",
         "max_run_s": "meeting_run_max_seconds",
         "min_avg_logprob": "meeting_min_avg_logprob",
+        "word_timestamps": "meeting_word_timestamps",
     }
 
     @classmethod
@@ -389,8 +406,11 @@ def transcribe_runs(
         logger.info(
             "run %d/%d at %.1fs (%.1fs) -> %s", index, len(runs), offset, limit - offset, lang
         )
+        extra = dict(transcribe_kwargs or {})
+        if settings.word_timestamps:
+            extra["word_timestamps"] = True
         segments, _ = model.transcribe(
-            chunk, vad_filter=False, language=lang, **(transcribe_kwargs or {})
+            chunk, vad_filter=False, language=lang, **extra
         )
         for seg in segments:
             text = seg.text.strip()
@@ -404,7 +424,13 @@ def transcribe_runs(
             # Whisper can place a segment past the audio it was given; the run's own
             # end is the truth, since that is where the VAD heard speech stop.
             cue_start = offset + seg.start
-            cues.append(Cue(cue_start, max(cue_start, min(offset + seg.end, limit)), text))
+            words = [
+                Word(offset + w.start, offset + w.end, w.word.strip(), w.probability)
+                for w in (getattr(seg, "words", None) or [])
+            ] if settings.word_timestamps else []
+            cues.append(
+                Cue(cue_start, max(cue_start, min(offset + seg.end, limit)), text, words)
+            )
         if progress:
             progress(index, len(runs))
     if dropped:
@@ -448,6 +474,32 @@ def _read_wav(path: Path) -> np.ndarray:
     with wave.open(str(path), "rb") as wf:
         data = wf.readframes(wf.getnframes())
     return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _write_words_json(cues: list[Cue], path: Path) -> None:
+    """Per-word timings beside the SRT, for measuring pauses and response latency.
+
+    Kept out of the SRT and the Markdown on purpose: both are for reading, and a cue
+    per word would make them useless for that.
+    """
+    payload = [
+        {
+            "start": round(c.start, 3),
+            "end": round(c.end, 3),
+            "text": c.text,
+            "words": [
+                {
+                    "start": round(w.start, 3),
+                    "end": round(w.end, 3),
+                    "text": w.text,
+                    "probability": round(w.probability, 3),
+                }
+                for w in c.words
+            ],
+        }
+        for c in cues
+    ]
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _session_log_handler(session_dir: Path) -> logging.Handler:
@@ -498,8 +550,10 @@ def finish_session(dictation, session_dir: Path, transcript_dir: Path) -> Path:
         model = dictation.meeting_model()
         allowlist = (dictation.config or {}).get("language_allowlist")
         settings = RunSettings.from_config(dictation.config)
-        # Built by Dictation from [meeting] custom_terms; absent in bare test doubles.
-        glossary = getattr(dictation, "meeting_terms_kwargs", None) or {}
+        # One glossary for every mode, built by Dictation from [behavior] custom_terms.
+        glossary = getattr(dictation, "custom_terms_kwargs", None) or {}
+        # Same for reject_phrases: the noise it filters is Whisper's, not dictation's.
+        reject = getattr(dictation, "should_reject_text", None)
 
         tracks: dict[str, list[Cue]] = {}
         for name in ("mic", "them"):
@@ -530,10 +584,20 @@ def finish_session(dictation, session_dir: Path, transcript_dir: Path) -> Path:
                 model, audio, allowlist=allowlist, settings=settings,
                 transcribe_kwargs=glossary, progress=report,
             )
+            if reject:
+                kept = [c for c in tracks[name] if not reject(c.text)]
+                if len(kept) != len(tracks[name]):
+                    logger.info(
+                        "Dropped %d cue(s) matching reject_phrases",
+                        len(tracks[name]) - len(kept),
+                    )
+                tracks[name] = kept
             logger.info(
                 "%s.wav -> %d cues in %.1fs", name, len(tracks[name]), time.monotonic() - t0
             )
             _write_srt(tracks[name], session_dir / f"{name}.srt")
+            if settings.word_timestamps:
+                _write_words_json(tracks[name], session_dir / f"{name}.words.json")
 
         config = dictation.config or {}
         blocks = merge_tracks(

@@ -550,14 +550,9 @@ def load_config():
         "meeting_min_avg_logprob": config.getfloat(
             "meeting", "min_avg_logprob", fallback=meeting_mod.MIN_AVG_LOGPROB
         ),
-        # Glossary priming for meeting transcription. Defaults to the dictation
-        # glossary; override when interview/meeting vocabulary differs from the terms
-        # dictated day to day. Measured on a real interview: without it Whisper wrote
-        # "sync 8 group" and "cup flow, air flow" for sync.WaitGroup and Kubeflow.
-        "meeting_custom_terms": config.get(
-            "meeting", "custom_terms",
-            fallback=config.get("behavior", "custom_terms", fallback=""),
-        ).strip(),
+        "meeting_word_timestamps": config.getboolean(
+            "meeting", "word_timestamps", fallback=meeting_mod.WORD_TIMESTAMPS
+        ),
         # How long a single speaker block may run before it is split with a fresh
         # timestamp. Your own track defaults to 60s: measured against a professional
         # transcript of the same 73-minute interview, that reproduces its shape
@@ -818,12 +813,11 @@ class Dictation:
         self._listener_restart_backoff_s = 1.0
 
         custom_terms = _parse_custom_terms(self.config.get("custom_terms") or "")
-        self._custom_terms_kwargs = _build_custom_terms_kwargs(custom_terms)
-        # Meeting mode primes the same way but from its own key, so the two glossaries
-        # can diverge. meeting.finish_session() reads this attribute.
-        self.meeting_terms_kwargs = _build_custom_terms_kwargs(
-            _parse_custom_terms(self.config.get("meeting_custom_terms") or "")
-        )
+        # One glossary for dictation and meetings alike; meeting.finish_session()
+        # reads this attribute.
+        self.custom_terms_kwargs = _build_custom_terms_kwargs(custom_terms)
+        # reject_phrases likewise applies to every mode.
+        self._reject_phrase_set = self._build_reject_phrase_set()
         if custom_terms:
             logger.info(f"Custom terms glossary active ({len(custom_terms)} term(s)): {custom_terms}")
 
@@ -1165,11 +1159,33 @@ class Dictation:
             audio_array,
             vad_filter=True,
             language=lang,
-            **self._custom_terms_kwargs,
+            **self.custom_terms_kwargs,
         )
         # Convert segments to text.
         text = self._segments_to_text(segments, self.config["auto_sentence"])
         return text, info.duration
+
+    def _build_reject_phrase_set(self) -> frozenset[str]:
+        raw = (self.config.get("reject_phrases") or "").strip()
+        if not raw:
+            return frozenset()
+        parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+        normalized = {_normalize_reject_phrase(p) for p in parts}
+        normalized.discard("")
+        return frozenset(normalized)
+
+    def should_reject_text(self, text: str) -> bool:
+        """
+        Reject only if the *whole text* equals one configured phrase (punctuation
+        ignored). Empty reject_phrases disables the feature. Shared by dictation
+        chunks and meeting cues alike.
+        """
+        if not self._reject_phrase_set:
+            return False
+        normalized = _normalize_reject_phrase(text)
+        if not normalized:
+            return False
+        return normalized in self._reject_phrase_set
 
     def meeting_model(self):
         """Whisper model used for meeting transcription, built on first use.
@@ -1684,7 +1700,7 @@ class Dictation:
             audio_array,
             vad_filter=False,
             language=lang,
-            **self._custom_terms_kwargs,
+            **self.custom_terms_kwargs,
         )
         with open(output_path, "w", encoding="utf-8") as out:
             if output_path.lower().endswith(".srt"):
@@ -1753,28 +1769,6 @@ class StreamingDictation(Dictation):
         self.speech_end_time: float = 0.0
         self.accumulated_text = ""
         self._last_hotkey_event_monotonic: Optional[float] = None
-        self._reject_phrase_set = self._build_reject_phrase_set()
-
-    def _build_reject_phrase_set(self) -> frozenset[str]:
-        raw = (self.config.get("reject_phrases") or "").strip()
-        if not raw:
-            return frozenset()
-        parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
-        normalized = {_normalize_reject_phrase(p) for p in parts}
-        normalized.discard("")
-        return frozenset(normalized)
-
-    def _should_reject_streaming_chunk(self, text: str) -> bool:
-        """
-        Reject only if the *whole chunk* equals one configured phrase (punctuation ignored).
-        If reject_phrases is empty, feature is disabled and nothing is rejected.
-        """
-        if not self._reject_phrase_set:
-            return False
-        normalized = _normalize_reject_phrase(text)
-        if not normalized:
-            return False
-        return normalized in self._reject_phrase_set
 
     def _finish_model_loading(self):
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
@@ -2031,14 +2025,14 @@ class StreamingDictation(Dictation):
                     language=lang,
                     condition_on_previous_text=True,
                     without_timestamps=True,
-                    **self._custom_terms_kwargs,
+                    **self.custom_terms_kwargs,
                 )
                 text = _streaming_segments_to_text(segments)
                 trans_duration = time.monotonic() - trans_start
                 if not text:
                     logger.info(f"[transcriber] Empty transcription (transcribed in {trans_duration:.2f}s)")
                     continue
-                if self._should_reject_streaming_chunk(text):
+                if self.should_reject_text(text):
                     logger.info("[reject] Skipping chunk (matched reject phrase): %r", text)
                     continue
                 else:
