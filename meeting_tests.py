@@ -1044,3 +1044,113 @@ class TestWordTimestampFile:
         session = self.run(tmp_path, monkeypatch, False)
 
         assert not (session / "mic.words.json").exists()
+
+
+def block(speaker, start, end, text):
+    return meeting.Block(speaker, start, end, text)
+
+
+class TestConversationMetrics:
+    """Frontmatter stats: who talked, how fast, and how long each waited."""
+
+    def test_speaking_ratio_is_me_over_them_by_duration(self):
+        blocks = [block("Me", 0.0, 30.0, "a b c"), block("Them", 30.0, 40.0, "d e")]
+
+        m = meeting.conversation_metrics(blocks)
+
+        assert m["me_speaking_s"] == 30.0
+        assert m["them_speaking_s"] == 10.0
+        assert m["speaking_ratio"] == 3.0
+
+    def test_ratio_is_none_when_only_one_side_spoke(self):
+        m = meeting.conversation_metrics([block("Me", 0.0, 10.0, "a")])
+
+        assert m["speaking_ratio"] is None
+        assert m["them_speaking_s"] == 0.0
+
+    def test_wpm_is_words_over_block_duration(self):
+        # 10 words in 30s = 20 wpm; 5 words in 10s = 30 wpm.
+        blocks = [block("Me", 0.0, 30.0, " ".join("w" * 10)),
+                  block("Me", 40.0, 50.0, " ".join("w" * 5))]
+
+        m = meeting.conversation_metrics(blocks)
+
+        assert m["me_wpm_avg"] == 25.0
+        assert m["me_wpm_stdev"] == 5.0
+
+    def test_think_time_only_counts_speaker_changes(self):
+        blocks = [
+            block("Them", 0.0, 10.0, "question"),
+            block("Me", 12.0, 20.0, "answer"),      # 2.0s after Them -> my think time
+            block("Me", 21.0, 25.0, "still me"),    # same speaker, not a think gap
+            block("Them", 27.0, 30.0, "reply"),     # 2.0s after Me -> their think time
+        ]
+
+        m = meeting.conversation_metrics(blocks)
+
+        assert m["me_think_time_avg_s"] == 2.0
+        assert m["them_think_time_avg_s"] == 2.0
+
+    def test_overlaps_are_not_counted_as_think_time(self):
+        # Interrupting gives a negative gap; averaging it in would understate waiting.
+        blocks = [block("Them", 0.0, 10.0, "q"),
+                  block("Me", 8.0, 12.0, "interrupting"),
+                  block("Them", 20.0, 22.0, "q2"),
+                  block("Me", 24.0, 26.0, "a")]
+
+        m = meeting.conversation_metrics(blocks)
+
+        assert m["me_think_time_avg_s"] == 2.0
+
+    def test_empty_transcript_yields_no_crash(self):
+        m = meeting.conversation_metrics([])
+
+        assert m["speaking_ratio"] is None
+        assert m["me_wpm_avg"] is None
+        assert m["me_think_time_avg_s"] is None
+
+
+class TestFrontmatter:
+    def test_render_markdown_emits_yaml_frontmatter(self):
+        blocks = [block("Me", 0.0, 30.0, " ".join("w" * 10)),
+                  block("Them", 40.0, 50.0, " ".join("w" * 10))]
+
+        out = meeting.render_markdown(blocks, "# Meeting x",
+                                      metrics=meeting.conversation_metrics(blocks))
+
+        assert out.startswith("---\n")
+        head = out.split("---")[1]
+        assert "speaking_ratio: 3.0" in head
+        assert "me_wpm_avg: 20.0" in head
+        assert "# Meeting x" in out
+
+    def test_none_values_render_as_empty(self):
+        out = meeting.render_markdown([block("Me", 0.0, 10.0, "hi")], "# x",
+                                      metrics=meeting.conversation_metrics(
+                                          [block("Me", 0.0, 10.0, "hi")]))
+
+        assert "speaking_ratio:\n" in out
+
+    def test_no_frontmatter_without_metrics(self):
+        out = meeting.render_markdown([block("Me", 0.0, 10.0, "hi")], "# x")
+
+        assert not out.startswith("---")
+
+    def test_finish_session_writes_frontmatter(self, tmp_path, monkeypatch):
+        import wave as w
+        session = tmp_path / "2026-09-07_120000"
+        session.mkdir(parents=True)
+        for name in ("mic.wav", "them.wav"):
+            with w.open(str(session / name), "wb") as f:
+                f.setnchannels(1); f.setsampwidth(2); f.setframerate(16000)
+                f.writeframes(b"\x00\x00" * 16000)
+        monkeypatch.setattr(
+            meeting, "speech_runs",
+            lambda audio, sample_rate=16000, settings=None: [(0, 16000)],
+        )
+
+        out = meeting.finish_session(
+            ProgressDictation(keep_audio=True), session, tmp_path / "docs"
+        )
+
+        assert out.read_text().startswith("---\n")

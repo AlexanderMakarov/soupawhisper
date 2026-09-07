@@ -212,7 +212,27 @@ Progress goes to `transcribe.log` in the session directory — one line per spee
 
 ### Measuring conversation timing
 
-`word_timestamps = true` additionally writes `mic.words.json` and `them.words.json` with per-word start and end times. Both tracks share one clock, so these support response latency, pause length, speaking rate, talk-time ratio and interruption counts. It costs extra transcription time and leaves the `.srt` and `.md` output unchanged.
+Every transcript opens with YAML frontmatter summarising the conversation:
+
+```yaml
+---
+speaking_ratio: 5.36        # your speaking time / theirs
+me_speaking_s: 111.4
+them_speaking_s: 20.8
+me_wpm_avg: 147.6           # words per minute, averaged over your turns
+me_wpm_stdev: 13.0
+them_wpm_avg: 173.6
+them_wpm_stdev: 3.6
+me_think_time_avg_s: 1.8    # your pause before answering them
+me_think_time_stdev_s: 0.7
+them_think_time_avg_s: 3.2
+them_think_time_stdev_s:    # empty when there was too little to measure
+---
+```
+
+Rates and pauses are measured per turn, not per subtitle cue, so a half-second cue holding one word cannot skew them. Think time counts only pauses where the speaker actually changed — a gap between two of your own turns is you drawing breath, not deciding — and overlaps are excluded rather than averaged in as negative waits. Spread is the population standard deviation, in the same unit as the average.
+
+For finer analysis, `word_timestamps = true` additionally writes `mic.words.json` and `them.words.json` with per-word start and end times. Both tracks share one clock, so these support response latency, pause length, speaking rate, talk-time ratio and interruption counts. It costs extra transcription time and leaves the `.srt` and `.md` output unchanged.
 
 
 ### Requirements

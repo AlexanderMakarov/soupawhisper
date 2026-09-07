@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import statistics
 import subprocess
 import tempfile
 import time
@@ -262,9 +263,85 @@ def _clock(seconds: float) -> str:
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
-def render_markdown(blocks: list[Block], header: str = "") -> str:
-    """Render merged blocks as a readable speaker-labelled transcript."""
-    parts = [header.rstrip()] if header else []
+def conversation_metrics(blocks: list[Block]) -> dict:
+    """Turn-taking statistics for the transcript frontmatter.
+
+    Measured on blocks rather than cues: a block is one speaker's turn as a reader
+    sees it, so words-per-minute is not skewed by a half-second cue holding one word.
+
+    Think time is the pause before someone starts, counted only where the speaker
+    actually changed -- a gap between two of your own blocks is you drawing breath,
+    not you deciding. Overlaps (interrupting, or a mic catching the far side) give a
+    negative gap and are excluded rather than averaged in, which would understate
+    how long people really waited.
+
+    Spread is the population standard deviation -- these blocks are the whole
+    meeting, not a sample of one -- in the same unit as the average, so
+    "142 wpm, sd 31" reads directly.
+    """
+    stats: dict = {}
+    for label, speaker in (("me", "Me"), ("them", "Them")):
+        mine = [b for b in blocks if b.speaker == speaker]
+        stats[f"{label}_speaking_s"] = round(float(sum(b.end - b.start for b in mine)), 1)
+        rates = [
+            len(b.text.split()) / ((b.end - b.start) / 60.0)
+            for b in mine
+            if b.end > b.start and b.text.split()
+        ]
+        stats[f"{label}_wpm_avg"] = round(statistics.fmean(rates), 1) if rates else None
+        stats[f"{label}_wpm_stdev"] = (
+            round(statistics.pstdev(rates), 1) if len(rates) > 1 else None
+        )
+
+    gaps: dict[str, list[float]] = {"Me": [], "Them": []}
+    for previous, current in zip(blocks, blocks[1:]):
+        if current.speaker == previous.speaker:
+            continue
+        gap = current.start - previous.end
+        if gap >= 0:
+            gaps[current.speaker].append(gap)
+    for label, speaker in (("me", "Me"), ("them", "Them")):
+        waits = gaps[speaker]
+        stats[f"{label}_think_time_avg_s"] = (
+            round(statistics.fmean(waits), 2) if waits else None
+        )
+        stats[f"{label}_think_time_stdev_s"] = (
+            round(statistics.pstdev(waits), 2) if len(waits) > 1 else None
+        )
+
+    them = stats["them_speaking_s"]
+    stats["speaking_ratio"] = round(stats["me_speaking_s"] / them, 2) if them else None
+    return stats
+
+
+_FRONTMATTER_ORDER = (
+    "speaking_ratio", "me_speaking_s", "them_speaking_s",
+    "me_wpm_avg", "me_wpm_stdev", "them_wpm_avg", "them_wpm_stdev",
+    "me_think_time_avg_s", "me_think_time_stdev_s",
+    "them_think_time_avg_s", "them_think_time_stdev_s",
+)
+
+
+def render_markdown(
+    blocks: list[Block], header: str = "", metrics: dict | None = None
+) -> str:
+    """Render merged blocks as a readable speaker-labelled transcript.
+
+    With metrics, a YAML frontmatter block leads -- readable as-is and parsed by
+    note tools. A metric that could not be computed is written as an empty value
+    rather than omitted, so the key set stays stable across meetings.
+    """
+    parts = []
+    if metrics is not None:
+        lines = ["---"]
+        lines += [
+            f"{key}:" if metrics.get(key) is None else f"{key}: {metrics[key]}"
+            for key in _FRONTMATTER_ORDER
+        ]
+        lines.append("---")
+        parts.append("\n".join(lines))
+    if header:
+        parts.append(header.rstrip())
     parts += [f"**[{_clock(b.start)}] {b.speaker}:** {b.text}" for b in blocks]
     return "\n\n".join(parts) + "\n"
 
@@ -605,7 +682,9 @@ def finish_session(dictation, session_dir: Path, transcript_dir: Path) -> Path:
             me_max_block_s=config.get("meeting_me_max_block_seconds", ME_MAX_BLOCK_S),
             them_max_block_s=config.get("meeting_them_max_block_seconds", THEM_MAX_BLOCK_S),
         )
-        text = render_markdown(blocks, f"# Meeting {session_dir.name}")
+        text = render_markdown(
+            blocks, f"# Meeting {session_dir.name}", conversation_metrics(blocks)
+        )
         out_path = transcript_dir / f"{session_dir.name}.md"
         out_path.write_text(text, encoding="utf-8")
         # A copy beside the audio and the SRTs, so one meeting's artifacts stay together.
