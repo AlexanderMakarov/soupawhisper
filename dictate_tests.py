@@ -1744,6 +1744,23 @@ class TestFileTranscriptionLanguage(NoBackgroundModelLoad):
         assert kwargs["language"] is not None
 
 
+class TestFileModeSkipsPynput(NoBackgroundModelLoad):
+    """--file / make transcribe must work without an X display (no pynput import)."""
+
+    def test_interactive_false_does_not_import_pynput(self, mock_config, monkeypatch):
+        def boom():
+            raise AssertionError("pynput must not be imported in file transcription mode")
+
+        monkeypatch.setattr(dictate, "_import_keyboard", boom)
+        monkeypatch.setattr(dictate, "get_hotkey", boom)
+
+        d = dictate.Dictation(dictate.load_config(), interactive=False)
+
+        assert d.hotkey is None
+        assert d.typer is None
+        assert d._interactive is False
+
+
 class TestMeetingModel(NoBackgroundModelLoad):
     """Meeting transcription gets its own model instance.
 
@@ -1878,7 +1895,7 @@ class TestStreamingListenerTracksReleases:
 
         d._create_hotkey_listener()
 
-        kwargs = dictate.keyboard.Listener.call_args.kwargs
+        kwargs = dictate._import_keyboard().Listener.call_args.kwargs
         assert "on_release" in kwargs
 
 
