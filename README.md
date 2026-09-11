@@ -245,6 +245,8 @@ For finer analysis, `word_timestamps = true` additionally writes `mic.words.json
 
 **No audio / wrong device**
 
+If no usable audio is captured, the app shows a “No audio detected” notification once per dictation session by default.
+
 - Run with `--verbose` and check the listed input devices.
 - Set `audio_input_device` in config to the correct index or name.
 - Ensure the microphone works in system settings and is not muted.

@@ -4,6 +4,7 @@ Tests for SoupaWhisper dictate.py
 """
 
 import pytest
+import logging
 import numpy as np
 import queue
 from unittest.mock import MagicMock, patch
@@ -697,6 +698,90 @@ class TestDictation:
         
         config = dictate.load_config()
         assert config["clipboard"] is False
+
+
+class TestNoAudioNotification:
+    """Tests for the once-per-session 'No audio detected' toast (notify_no_audio)."""
+
+    def test_notify_no_audio_defaults_to_true(self, mock_config):
+        """Absent from config: one toast per session is the default."""
+        config = dictate.load_config()
+        assert config["notify_no_audio"] is True
+
+    def test_notify_no_audio_can_be_disabled(self, mock_config):
+        content = mock_config.read_text()
+        mock_config.write_text(content.replace("clipboard = true", "clipboard = true\nnotify_no_audio = false"))
+
+        config = dictate.load_config()
+        assert config["notify_no_audio"] is False
+
+    def test_report_audio_problem_logs_but_does_not_notify_when_disabled(
+        self, mock_config, mock_whisper_model, caplog
+    ):
+        config = dictate.load_config()
+        config["notify_no_audio"] = False
+        d = dictate.Dictation(config)
+
+        with caplog.at_level(logging.WARNING, logger="dictate"):
+            with patch.object(d, "notify") as mock_notify:
+                with patch.object(d, "_get_available_input_devices") as mock_devices:
+                    d._report_audio_problem("Audio input is effectively silent (too low amplitude)")
+
+        mock_notify.assert_not_called()
+        # Device enumeration is only needed for the notification body.
+        mock_devices.assert_not_called()
+        assert "Audio input is effectively silent (too low amplitude)" in caplog.text
+
+    def test_report_audio_problem_notifies_once_per_session_by_default(
+        self, mock_config, mock_whisper_model
+    ):
+        config = dictate.load_config()
+        assert config["notify_no_audio"] is True
+        d = dictate.Dictation(config)
+
+        with patch.object(d, "notify") as mock_notify:
+            with patch.object(d, "_get_available_input_devices", return_value=[(0, "test device", 1)]):
+                d._report_audio_problem("Audio input contains only zeros")
+                d._report_audio_problem("Audio input is effectively silent (too low amplitude)")
+                d._report_audio_problem("No audio data recorded")
+
+        assert mock_notify.call_count == 1
+        assert mock_notify.call_args[0][0] == "No audio detected - check device"
+        assert mock_notify.call_args[0][3] == 5000
+
+    def test_check_valid_audio_input_still_rejects_silent_segments(
+        self, mock_config, mock_whisper_model
+    ):
+        """Suppressing the notification must not change segment filtering."""
+        config = dictate.load_config()
+        config["notify_no_audio"] = False
+        d = dictate.Dictation(config)
+
+        with patch.object(d, "notify") as mock_notify:
+            assert d._check_valid_audio_input(np.zeros(1600, dtype=np.int16)) is True
+            assert d._check_valid_audio_input(np.full(1600, 10, dtype=np.int16)) is True
+            assert d._check_valid_audio_input(np.full(1600, 5000, dtype=np.int16)) is False
+
+        mock_notify.assert_not_called()
+
+    def test_start_recording_resets_notified_flag(
+        self, mock_config, mock_whisper_model, mock_xdotool
+    ):
+        config = dictate.load_config()
+        d = dictate.Dictation(config)
+        d.model_loaded.set()
+        d._audio_problem_notified = True
+
+        with patch.object(d, "_start_pyaudio_stream", return_value=MagicMock()):
+            with patch.object(d, "_audio_recording_worker"):
+                with patch.object(d, "notify"):
+                    d.start_recording()
+
+        assert d._audio_problem_notified is False
+        d.recording = False
+        if d.audio_thread:
+            d.audio_thread.join(timeout=1.0)
+
 
 class TestClipboardIntegration:
     """Tests specifically for the clipboard parameter integration."""
