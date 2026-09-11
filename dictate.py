@@ -27,8 +27,18 @@ import webrtcvad
 
 import meeting as meeting_mod
 
-from pynput import keyboard
 from faster_whisper import WhisperModel
+
+
+def _import_keyboard():
+    """Import pynput.keyboard only when needed.
+
+    On Linux pynput opens an X11 display at import time, so a top-level import
+    breaks headless ``--file`` / ``make transcribe`` when DISPLAY is unset.
+    """
+    from pynput import keyboard
+
+    return keyboard
 
 __version__ = "0.1.0"
 
@@ -628,8 +638,9 @@ def parse_hotkey_spec(spec: str) -> tuple[frozenset[str], str]:
     return modifiers, key
 
 
-def get_hotkey(key_name: str) -> keyboard.KeyCode:
+def get_hotkey(key_name: str):
     """Map key name to pynput key."""
+    keyboard = _import_keyboard()
     key_name = key_name.lower()
     if hasattr(keyboard.Key, key_name):
         return getattr(keyboard.Key, key_name)
@@ -681,11 +692,13 @@ class Typer:
         self.delay_ms = max(0, int(delay_ms))
         self.start_delay_ms = int(start_delay_ms)
         self._controller = None
+        self._keyboard = None
         if IS_MACOS:
             # Quartz key events need only Accessibility, which the hotkey listener already
             # holds. Driving System Events over AppleScript would additionally require
             # Automation access, and blocks on its consent dialog until the call times out.
-            self._controller = keyboard.Controller()
+            self._keyboard = _import_keyboard()
+            self._controller = self._keyboard.Controller()
             self.enabled = True
         else:
             self.enabled = subprocess.run(["which", "xdotool"], capture_output=True).returncode == 0
@@ -713,7 +726,7 @@ class Typer:
         # Quartz carries the characters as a Unicode string, so the active keyboard layout
         # does not rewrite them — Latin and Cyrillic both arrive as spoken.
         for _ in range(previous_length):
-            self._controller.tap(keyboard.Key.backspace)
+            self._controller.tap(self._keyboard.Key.backspace)
         if self.delay_ms <= 0:
             self._controller.type(text)
             return
@@ -738,13 +751,9 @@ class Typer:
 
 
 class Dictation:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, interactive: bool = True):
         self.config = config
-        self.hotkey = get_hotkey(config["key"])
-        # Precompute for keys_match (avoids getattr on every keypress)
-        self._hotkey_value = getattr(self.hotkey, "value", None)
-        hv = self._hotkey_value
-        self._hotkey_vk = getattr(hv, "vk", None) if hv is not None else getattr(self.hotkey, "vk", None)
+        self._interactive = interactive
         self.recording = False
         self.transcribing = False
         # Meeting recording is a separate, mutually exclusive mode: while it runs the
@@ -757,7 +766,6 @@ class Dictation:
         self._meeting_stop_event = threading.Event()
         meeting_mods, meeting_key_name = parse_hotkey_spec(config.get("meeting_hotkey", ""))
         self._meeting_modifiers = meeting_mods
-        self._meeting_key = get_hotkey(meeting_key_name) if meeting_key_name else None
         self._held_modifiers: set[str] = set()
         self._modifier_source = active_modifiers_x11
         self._meeting_model = None
@@ -787,6 +795,20 @@ class Dictation:
         self._keyboard_listener = None
         self._listener_restart_backoff_s = 1.0
 
+        # Hotkeys / pynput need a display on Linux; skip for headless --file mode.
+        if interactive:
+            self.hotkey = get_hotkey(config["key"])
+            # Precompute for keys_match (avoids getattr on every keypress)
+            self._hotkey_value = getattr(self.hotkey, "value", None)
+            hv = self._hotkey_value
+            self._hotkey_vk = getattr(hv, "vk", None) if hv is not None else getattr(self.hotkey, "vk", None)
+            self._meeting_key = get_hotkey(meeting_key_name) if meeting_key_name else None
+        else:
+            self.hotkey = None
+            self._hotkey_value = None
+            self._hotkey_vk = None
+            self._meeting_key = None
+
         custom_terms = _parse_custom_terms(self.config.get("custom_terms") or "")
         # One glossary for dictation and meetings alike; meeting.finish_session()
         # reads this attribute.
@@ -796,7 +818,7 @@ class Dictation:
         if custom_terms:
             logger.info(f"Custom terms glossary active ({len(custom_terms)} term(s)): {custom_terms}")
 
-        if self.config["auto_type"]:
+        if interactive and self.config["auto_type"]:
             self.typer = Typer(
                 delay_ms=int(self.config["typing_delay"] * 1000),
                 start_delay_ms=100,  # Delay to avoid modifiers from hotkey
@@ -807,6 +829,8 @@ class Dictation:
         threading.Thread(target=self._load_model, daemon=True).start()
 
     def get_hotkey_name(self) -> str:
+        if self.hotkey is None:
+            return self.config.get("key", DEFAULT_HOTKEY)
         return getattr(self.hotkey, 'name', None) or getattr(self.hotkey, 'char', DEFAULT_HOTKEY)
 
     def _load_model(self):
@@ -823,6 +847,9 @@ class Dictation:
                 logger.info("Hint: Try setting device = cpu in your config, or install cuDNN.")
 
     def _finish_model_loading(self):
+        if not self._interactive:
+            logger.info("Model ready (file transcription mode).")
+            return
         logger.info(f"Hold [{self.get_hotkey_name()}] to start dictation, release to transcribe. Press Ctrl+C to quit.")
 
     def _get_input_device_index(self) -> Optional[int]:
@@ -1405,7 +1432,8 @@ class Dictation:
             self._keyboard_listener.stop()
         self._stop_tray()
 
-    def _create_hotkey_listener(self) -> keyboard.Listener:
+    def _create_hotkey_listener(self):
+        keyboard = _import_keyboard()
         listener = keyboard.Listener(
             on_press=self.on_press,
             on_release=self.on_release,
@@ -1413,7 +1441,7 @@ class Dictation:
         listener.daemon = True
         return listener
 
-    def _start_hotkey_listener(self) -> keyboard.Listener:
+    def _start_hotkey_listener(self):
         listener = self._create_hotkey_listener()
         listener.start()
         self._keyboard_listener = listener
@@ -1744,9 +1772,13 @@ class StreamingDictation(Dictation):
         self._last_hotkey_event_monotonic: Optional[float] = None
 
     def _finish_model_loading(self):
+        if not self._interactive:
+            logger.info("Model ready (file transcription mode).")
+            return
         logger.info(f"Press [{self.get_hotkey_name().upper()}] to start transcribing, press one more time to stop. Press Ctrl+C to quit.")
 
-    def _create_hotkey_listener(self) -> keyboard.Listener:
+    def _create_hotkey_listener(self):
+        keyboard = _import_keyboard()
         listener = keyboard.Listener(
             on_press=self.on_press,
             on_release=self.on_release,
@@ -2283,29 +2315,16 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
         help="With --file: write transcript to this path (.srt for subtitles with timestamps, anything else for plain text)"
     )
     args = parser.parse_args()
-    check_dependencies(config)
 
     # Apply arguments.
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Determine streaming mode
-    use_streaming = config["default_streaming"]
-    if args.streaming:
-        use_streaming = True
-    elif args.no_streaming:
-        use_streaming = False
-
-    # Create dictation object.
-    if use_streaming:
-        dictation = StreamingDictation(config)
-    else:
-        dictation = Dictation(config)
-
-    # Handle file transcription mode.
+    # Handle file transcription mode (headless: no X11 / pynput / clipboard tools).
     if args.file:
         if not os.path.exists(args.file):
             raise FileNotFoundError(f"WAV file not found: {args.file}")
+        dictation = Dictation(config, interactive=False)
         dictation.model_loaded.wait()
         if dictation.model_error or dictation.model is None:
             logger.error("Cannot transcribe file: model failed to load")
@@ -2319,6 +2338,21 @@ Available models: tiny, tiny.en, base, base.en, small, small.en, medium, medium.
         except Exception as e:
             logger.error(f"Failed to transcribe file: {e}", exc_info=True)
             sys.exit(1)
+
+    check_dependencies(config)
+
+    # Determine streaming mode
+    use_streaming = config["default_streaming"]
+    if args.streaming:
+        use_streaming = True
+    elif args.no_streaming:
+        use_streaming = False
+
+    # Create dictation object.
+    if use_streaming:
+        dictation = StreamingDictation(config)
+    else:
+        dictation = Dictation(config)
 
     # Handle Ctrl+C and SIGTERM gracefully
     def handle_signal(sig, frame):

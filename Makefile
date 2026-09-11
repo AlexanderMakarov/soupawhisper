@@ -66,9 +66,9 @@ transcribe:
 	trap 'rm -f "$$WAV"' EXIT; \
 	ffmpeg -y -loglevel error -i "$$F" -ar 16000 -ac 1 -c:a pcm_s16le "$$WAV" || exit 1; \
 	if command -v uv >/dev/null 2>&1; then \
-		uv run python dictate.py --file "$$WAV" --output "$$OUT"; \
+		uv run python dictate.py --file "$$WAV" --output "$$OUT" || exit 1; \
 	elif command -v poetry >/dev/null 2>&1; then \
-		poetry run python dictate.py --file "$$WAV" --output "$$OUT"; \
+		poetry run python dictate.py --file "$$WAV" --output "$$OUT" || exit 1; \
 	else \
 		echo "Error: Neither uv nor poetry found. Please install one of them."; \
 		exit 1; \
