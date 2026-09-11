@@ -1895,7 +1895,7 @@ class TestStreamingListenerTracksReleases:
 
         d._create_hotkey_listener()
 
-        kwargs = dictate.keyboard.Listener.call_args.kwargs
+        kwargs = dictate._import_keyboard().Listener.call_args.kwargs
         assert "on_release" in kwargs
 
 
