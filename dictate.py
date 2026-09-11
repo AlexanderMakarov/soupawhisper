@@ -497,8 +497,8 @@ def load_config():
         "auto_sentence": config.getboolean("behavior", "auto_sentence", fallback=True),
         "typing_delay": config.getfloat("behavior", "typing_delay", fallback=0.01),
         "save_recordings": config.getboolean("behavior", "save_recordings", fallback=False),
-        # Desktop notification when the microphone delivers silence. The log always records it.
-        "notify_no_audio": config.getboolean("behavior", "notify_no_audio", fallback=False),
+        # Desktop toast when the microphone delivers silence (once per session). Log always records it.
+        "notify_no_audio": config.getboolean("behavior", "notify_no_audio", fallback=True),
         # Streaming-only: comma-separated phrases to suppress if a chunk equals one of them
         # (punctuation ignored). If empty, feature is disabled.
         "reject_phrases": config.get("behavior", "reject_phrases", fallback="").strip(),
@@ -907,16 +907,15 @@ class Dictation:
     def _report_audio_problem(self, issue_description: str = "No audio detected"):
         """Report that the microphone delivered no usable audio.
 
-        Always logged at WARNING. The on-screen notification is opt-in via
-        'notify_no_audio' and, when enabled, shown at most once per dictation session:
-        in streaming mode every pause between utterances hits this path, so notifying
-        per segment stacks tall banners over whatever the user is clicking.
+        Always logged at WARNING. By default a desktop toast is shown at most once
+        per dictation session (``notify_no_audio``); streaming pauses would otherwise
+        stack banners. Set ``notify_no_audio = false`` to suppress the toast.
 
         Args:
             issue_description: Description of the audio input issue (e.g., "Audio input contains only zeros" or "Audio input has too low amplitude")
         """
         logger.warning(f"[record] {issue_description}")
-        if not self.config.get("notify_no_audio", False):
+        if not self.config.get("notify_no_audio", True):
             return
         if self._audio_problem_notified:
             return
@@ -929,7 +928,7 @@ class Dictation:
             devices_text += f"\n  ... and {len(devices_list) - 8} more"
         config_path = CONFIG_PATH
         message = f"{issue_description}\n\nSet 'audio_input_device' in {config_path}\nSupported (by pyaudio, not on this machine!) devices:\n{devices_text}"
-        self.notify("No audio detected - check device", message, logging.WARNING, 10000)
+        self.notify("No audio detected - check device", message, logging.WARNING, 5000)
 
     def _check_valid_audio_input(self, audio_buffer: np.ndarray) -> bool:
         """

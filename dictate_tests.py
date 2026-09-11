@@ -701,19 +701,19 @@ class TestDictation:
 
 
 class TestNoAudioNotification:
-    """Tests for the opt-in 'No audio detected' notification (notify_no_audio)."""
+    """Tests for the once-per-session 'No audio detected' toast (notify_no_audio)."""
 
-    def test_notify_no_audio_defaults_to_false(self, mock_config):
-        """Absent from config: silent segments must not raise banners."""
-        config = dictate.load_config()
-        assert config["notify_no_audio"] is False
-
-    def test_notify_no_audio_can_be_enabled(self, mock_config):
-        content = mock_config.read_text()
-        mock_config.write_text(content.replace("clipboard = true", "clipboard = true\nnotify_no_audio = true"))
-
+    def test_notify_no_audio_defaults_to_true(self, mock_config):
+        """Absent from config: one toast per session is the default."""
         config = dictate.load_config()
         assert config["notify_no_audio"] is True
+
+    def test_notify_no_audio_can_be_disabled(self, mock_config):
+        content = mock_config.read_text()
+        mock_config.write_text(content.replace("clipboard = true", "clipboard = true\nnotify_no_audio = false"))
+
+        config = dictate.load_config()
+        assert config["notify_no_audio"] is False
 
     def test_report_audio_problem_logs_but_does_not_notify_when_disabled(
         self, mock_config, mock_whisper_model, caplog
@@ -732,11 +732,11 @@ class TestNoAudioNotification:
         mock_devices.assert_not_called()
         assert "Audio input is effectively silent (too low amplitude)" in caplog.text
 
-    def test_report_audio_problem_notifies_once_per_session_when_enabled(
+    def test_report_audio_problem_notifies_once_per_session_by_default(
         self, mock_config, mock_whisper_model
     ):
         config = dictate.load_config()
-        config["notify_no_audio"] = True
+        assert config["notify_no_audio"] is True
         d = dictate.Dictation(config)
 
         with patch.object(d, "notify") as mock_notify:
@@ -747,6 +747,7 @@ class TestNoAudioNotification:
 
         assert mock_notify.call_count == 1
         assert mock_notify.call_args[0][0] == "No audio detected - check device"
+        assert mock_notify.call_args[0][3] == 5000
 
     def test_check_valid_audio_input_still_rejects_silent_segments(
         self, mock_config, mock_whisper_model
