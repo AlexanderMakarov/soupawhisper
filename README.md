@@ -245,11 +245,11 @@ For finer analysis, `word_timestamps = true` additionally writes `mic.words.json
 
 **No audio / wrong device**
 
+If no usable audio is captured, the app shows a “No audio detected” notification once per dictation session by default.
+
 - Run with `--verbose` and check the listed input devices.
 - Set `audio_input_device` in config to the correct index or name.
 - Ensure the microphone works in system settings and is not muted.
-
-Silent input is always logged. A desktop toast (“No audio detected”) also fires **once per dictation session** by default (not on every pause), so a dead mic is visible without stacking banners over the UI. Set `notify_no_audio = false` under `[behavior]` to suppress the toast.
 
 **Bad transcription / suspect the mic, not the model**
 
